@@ -87,7 +87,7 @@ async def spawn_runner(installation_id: int, org: str, labels: list[str], job_id
             return
 
         image = _parse_image(labels)
-        custom_labels = [lbl for lbl in labels if not lbl.startswith("runner-image:") and lbl not in _GITHUB_HOSTED]
+        custom_labels = [lbl for lbl in labels if lbl not in _GITHUB_HOSTED]
         env = {
             "RUNNER_SCOPE": "org",
             "ORG_NAME": org,
