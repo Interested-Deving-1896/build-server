@@ -61,6 +61,9 @@ async def webhook(request: Request):
         log.warning("Ignored job from unlisted org=%s job_id=%d", org, job_id)
         return {"ok": True}
 
+    if "self-hosted" not in labels:
+        return {"ok": True}
+
     log.info("Job queued: org=%s job_id=%d labels=%s", org, job_id, labels)
     asyncio.create_task(spawn_runner(installation_id, org, labels, job_id))
     return {"ok": True}
