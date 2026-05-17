@@ -8,7 +8,7 @@ import docker
 from fastapi import FastAPI, HTTPException, Request
 from github import GithubIntegration
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 app = FastAPI()
@@ -56,7 +56,6 @@ async def webhook(request: Request):
 
     payload = await request.json()
     action = payload.get("action")
-    log.debug("Webhook received: action=%s event=%s", action, "workflow_job" if "workflow_job" in payload else "other")
     if action != "queued" or "workflow_job" not in payload:
         return {"ok": True}
 
