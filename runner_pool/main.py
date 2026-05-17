@@ -3,8 +3,11 @@ import hashlib
 import hmac
 import logging
 import os
+import time
 
 import docker
+import jwt as _jwt
+import requests as _requests
 from fastapi import FastAPI, HTTPException, Request
 from github import GithubIntegration
 
@@ -15,7 +18,8 @@ app = FastAPI()
 docker_client = docker.from_env()
 
 _private_key = os.environ["GITHUB_APP_PRIVATE_KEY"].replace("\\n", "\n")
-gi = GithubIntegration(os.environ["GITHUB_APP_ID"], _private_key)
+_app_id = int(os.environ["GITHUB_APP_ID"])
+gi = GithubIntegration(_app_id, _private_key)
 
 MAX_RUNNERS = int(os.getenv("MAX_RUNNERS") or os.cpu_count())
 # Max seconds a container may run before being killed — prevents idle leaks
@@ -57,6 +61,23 @@ def _verify_signature(body: bytes, header: str) -> None:
         raise HTTPException(status_code=401, detail="invalid signature")
 
 
+def _resolve_installation_id(org: str, owner_type: str) -> int | None:
+    """Look up the GitHub App installation ID for an org/user via the App API."""
+    now = int(time.time())
+    token = _jwt.encode({"iat": now - 60, "exp": now + 600, "iss": str(_app_id)}, _private_key, algorithm="RS256")
+    segment = "users" if owner_type == "User" else "orgs"
+    url = f"https://api.github.com/{segment}/{org}/installation"
+    resp = _requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=10,
+    )
+    if resp.ok:
+        return resp.json()["id"]
+    log.warning("Installation lookup failed for org=%s: %s", org, resp.text[:200])
+    return None
+
+
 @app.post("/webhook")
 async def webhook(request: Request):
     body = await request.body()
@@ -67,7 +88,7 @@ async def webhook(request: Request):
     if action != "queued" or "workflow_job" not in payload:
         return {"ok": True}
 
-    installation_id = payload["installation"]["id"]
+    installation_id = (payload.get("installation") or {}).get("id")
     org = payload["repository"]["owner"]["login"]
     owner_type = payload["repository"]["owner"].get("type", "Organization")
     repo_full_name = payload["repository"]["full_name"]
@@ -83,6 +104,12 @@ async def webhook(request: Request):
 
     if any(lbl in _NON_LINUX_OS for lbl in labels):
         log.info("Skipped non-Linux job: org=%s job_id=%d labels=%s", org, job_id, labels)
+        return {"ok": True}
+
+    if not installation_id:
+        installation_id = _resolve_installation_id(org, owner_type)
+    if not installation_id:
+        log.warning("Could not resolve installation_id for org=%s job_id=%d — skipping", org, job_id)
         return {"ok": True}
 
     log.info("Job queued: org=%s job_id=%d labels=%s", org, job_id, labels)
