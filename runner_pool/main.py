@@ -32,6 +32,11 @@ _GITHUB_HOSTED = {
     "macos-latest", "macos-14", "macos-13", "macos-12",
 }
 
+# OS labels indicating a platform-specific pre-registered runner — do not spawn.
+# "Windows" and "macOS" are the OS labels GitHub assigns when a runner's OS is
+# detected; a Linux VPS can never serve these jobs.
+_NON_LINUX_OS = {"Windows", "macOS"}
+
 log.info(
     "Build server starting: MAX_RUNNERS=%d RUNNER_TIMEOUT=%ds DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
     MAX_RUNNERS, RUNNER_TIMEOUT, DEFAULT_IMAGE, ALLOWED_ORGS or "unrestricted",
@@ -72,6 +77,10 @@ async def webhook(request: Request):
         return {"ok": True}
 
     if all(lbl in _GITHUB_HOSTED for lbl in labels):
+        return {"ok": True}
+
+    if any(lbl in _NON_LINUX_OS for lbl in labels):
+        log.info("Skipped non-Linux job: org=%s job_id=%d labels=%s", org, job_id, labels)
         return {"ok": True}
 
     log.info("Job queued: org=%s job_id=%d labels=%s", org, job_id, labels)
