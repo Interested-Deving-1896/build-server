@@ -69,6 +69,8 @@ async def webhook(request: Request):
 
     installation_id = payload["installation"]["id"]
     org = payload["repository"]["owner"]["login"]
+    owner_type = payload["repository"]["owner"].get("type", "Organization")
+    repo_full_name = payload["repository"]["full_name"]
     labels: list[str] = payload["workflow_job"].get("labels", [])
     job_id = payload["workflow_job"]["id"]
 
@@ -84,11 +86,14 @@ async def webhook(request: Request):
         return {"ok": True}
 
     log.info("Job queued: org=%s job_id=%d labels=%s", org, job_id, labels)
-    asyncio.create_task(spawn_runner(installation_id, org, labels, job_id))
+    asyncio.create_task(spawn_runner(installation_id, org, owner_type, repo_full_name, labels, job_id))
     return {"ok": True}
 
 
-async def spawn_runner(installation_id: int, org: str, labels: list[str], job_id: int):
+async def spawn_runner(
+    installation_id: int, org: str, owner_type: str,
+    repo_full_name: str, labels: list[str], job_id: int,
+):
     async with sem:
         active = MAX_RUNNERS - sem._value  # noqa: SLF001
         log.info("Spawning runner: org=%s job_id=%d active=%d/%d", org, job_id, active, MAX_RUNNERS)
@@ -100,14 +105,26 @@ async def spawn_runner(installation_id: int, org: str, labels: list[str], job_id
 
         image = _parse_image(labels)
         custom_labels = [lbl for lbl in labels if lbl not in _GITHUB_HOSTED]
-        env = {
-            "RUNNER_SCOPE": "org",
-            "ORG_NAME": org,
-            "ACCESS_TOKEN": token,
-            "EPHEMERAL": "true",
-            "DISABLE_AUTO_UPDATE": "true",
-            "LABELS": ",".join(custom_labels),
-        }
+
+        if owner_type == "User":
+            # Personal accounts don't have org-level runners — register at repo scope.
+            env = {
+                "RUNNER_SCOPE": "repo",
+                "REPO_URL": f"https://github.com/{repo_full_name}",
+                "ACCESS_TOKEN": token,
+                "EPHEMERAL": "true",
+                "DISABLE_AUTO_UPDATE": "true",
+                "LABELS": ",".join(custom_labels),
+            }
+        else:
+            env = {
+                "RUNNER_SCOPE": "org",
+                "ORG_NAME": org,
+                "ACCESS_TOKEN": token,
+                "EPHEMERAL": "true",
+                "DISABLE_AUTO_UPDATE": "true",
+                "LABELS": ",".join(custom_labels),
+            }
 
         loop = asyncio.get_event_loop()
         try:
