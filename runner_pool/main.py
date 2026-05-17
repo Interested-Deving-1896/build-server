@@ -22,9 +22,16 @@ _app_id = int(os.environ["GITHUB_APP_ID"])
 gi = GithubIntegration(_app_id, _private_key)
 
 MAX_RUNNERS = int(os.getenv("MAX_RUNNERS") or os.cpu_count())
-# Max seconds a container may run before being killed — prevents idle leaks
-# when a runner registers with wrong labels and never receives a job.
-RUNNER_TIMEOUT = int(os.getenv("RUNNER_TIMEOUT", "600"))
+# Seconds a runner may sit idle ("Listening for Jobs") without ever picking
+# up a job before it is killed — catches runners that registered with wrong
+# labels and will never receive work.
+RUNNER_IDLE_TIMEOUT = int(os.getenv("RUNNER_IDLE_TIMEOUT", "600"))
+# Max seconds a runner may spend executing a job once it has started. Long
+# CI jobs (migrations + seed + integration tests) legitimately exceed 10 min;
+# GitHub's own default job timeout is 6 h, so this is a generous safety net.
+RUNNER_JOB_TIMEOUT = int(os.getenv("RUNNER_JOB_TIMEOUT", "7200"))
+# How often (s) to poll a running container's status and logs.
+RUNNER_POLL_INTERVAL = int(os.getenv("RUNNER_POLL_INTERVAL", "15"))
 sem = asyncio.Semaphore(MAX_RUNNERS)
 DEFAULT_IMAGE = os.environ["DEFAULT_RUNNER_IMAGE"]
 ALLOWED_ORGS: set[str] = set(filter(None, os.getenv("ALLOWED_ORGS", "").split(",")))
@@ -42,8 +49,8 @@ _GITHUB_HOSTED = {
 _NON_LINUX_OS = {"Windows", "macOS"}
 
 log.info(
-    "Build server starting: MAX_RUNNERS=%d RUNNER_TIMEOUT=%ds DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
-    MAX_RUNNERS, RUNNER_TIMEOUT, DEFAULT_IMAGE, ALLOWED_ORGS or "unrestricted",
+    "Build server starting: MAX_RUNNERS=%d IDLE_TIMEOUT=%ds JOB_TIMEOUT=%ds DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
+    MAX_RUNNERS, RUNNER_IDLE_TIMEOUT, RUNNER_JOB_TIMEOUT, DEFAULT_IMAGE, ALLOWED_ORGS or "unrestricted",
 )
 
 
@@ -168,15 +175,54 @@ async def spawn_runner(
             log.exception("Runner start failed: org=%s job_id=%d image=%s", org, job_id, image)
             return
 
+        # Poll the container: distinguish an idle runner (registered with the
+        # wrong labels, will never get a job) from one actively executing a
+        # long job. Idle runners are killed quickly; working runners get a
+        # generous job timeout. Ephemeral runners exit on their own once the
+        # single job completes, so the happy path ends via the status check.
+        start = asyncio.get_event_loop().time()
+        job_started_at: float | None = None
         try:
-            result = await asyncio.wait_for(
-                loop.run_in_executor(None, container.wait),
-                timeout=RUNNER_TIMEOUT,
-            )
-            log.info("Runner finished: org=%s job_id=%d exit=%d", org, job_id, result.get("StatusCode", -1))
-        except asyncio.TimeoutError:
-            log.warning("Runner timed out after %ds: org=%s job_id=%d — killing", RUNNER_TIMEOUT, org, job_id)
-            await loop.run_in_executor(None, container.kill)
+            while True:
+                await asyncio.sleep(RUNNER_POLL_INTERVAL)
+                try:
+                    await loop.run_in_executor(None, container.reload)
+                except docker.errors.NotFound:
+                    log.info("Runner container gone: org=%s job_id=%d", org, job_id)
+                    return
+                if container.status != "running":
+                    result = await loop.run_in_executor(None, container.wait)
+                    log.info(
+                        "Runner finished: org=%s job_id=%d exit=%d",
+                        org, job_id, result.get("StatusCode", -1),
+                    )
+                    break
+
+                now = asyncio.get_event_loop().time()
+                if job_started_at is None:
+                    try:
+                        logs = await loop.run_in_executor(
+                            None, lambda: container.logs().decode("utf-8", "replace")
+                        )
+                    except Exception:
+                        logs = ""
+                    if "Running job:" in logs:
+                        job_started_at = now
+                        log.info("Runner picked up job: org=%s job_id=%d", org, job_id)
+                    elif now - start > RUNNER_IDLE_TIMEOUT:
+                        log.warning(
+                            "Runner idle %ds without a job: org=%s job_id=%d — killing",
+                            RUNNER_IDLE_TIMEOUT, org, job_id,
+                        )
+                        await loop.run_in_executor(None, container.kill)
+                        break
+                elif now - job_started_at > RUNNER_JOB_TIMEOUT:
+                    log.warning(
+                        "Job exceeded %ds: org=%s job_id=%d — killing",
+                        RUNNER_JOB_TIMEOUT, org, job_id,
+                    )
+                    await loop.run_in_executor(None, container.kill)
+                    break
         except Exception:
             log.exception("Runner wait failed: org=%s job_id=%d", org, job_id)
         finally:
