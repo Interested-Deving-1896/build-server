@@ -18,11 +18,14 @@ _private_key = os.environ["GITHUB_APP_PRIVATE_KEY"].replace("\\n", "\n")
 gi = GithubIntegration(os.environ["GITHUB_APP_ID"], _private_key)
 
 MAX_RUNNERS = int(os.getenv("MAX_RUNNERS") or os.cpu_count())
+# Max seconds a container may run before being killed — prevents idle leaks
+# when a runner registers with wrong labels and never receives a job.
+RUNNER_TIMEOUT = int(os.getenv("RUNNER_TIMEOUT", "600"))
 sem = asyncio.Semaphore(MAX_RUNNERS)
 DEFAULT_IMAGE = os.environ["DEFAULT_RUNNER_IMAGE"]
 ALLOWED_ORGS: set[str] = set(filter(None, os.getenv("ALLOWED_ORGS", "").split(",")))
 
-# Jobs targeting GitHub-hosted runners only — no point spawning a self-hosted runner
+# Labels used exclusively by GitHub-hosted runners — skip spawning for these.
 _GITHUB_HOSTED = {
     "ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-20.04", "ubuntu-18.04",
     "windows-latest", "windows-2022", "windows-2019",
@@ -30,8 +33,8 @@ _GITHUB_HOSTED = {
 }
 
 log.info(
-    "Build server starting: MAX_RUNNERS=%d DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
-    MAX_RUNNERS, DEFAULT_IMAGE, ALLOWED_ORGS or "unrestricted",
+    "Build server starting: MAX_RUNNERS=%d RUNNER_TIMEOUT=%ds DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
+    MAX_RUNNERS, RUNNER_TIMEOUT, DEFAULT_IMAGE, ALLOWED_ORGS or "unrestricted",
 )
 
 
@@ -99,15 +102,32 @@ async def spawn_runner(installation_id: int, org: str, labels: list[str], job_id
 
         loop = asyncio.get_event_loop()
         try:
-            await loop.run_in_executor(
+            container = await loop.run_in_executor(
                 None,
                 lambda: docker_client.containers.run(
                     image,
-                    remove=True,
+                    detach=True,
                     volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
                     environment=env,
                 ),
             )
-            log.info("Runner finished: org=%s job_id=%d", org, job_id)
         except Exception:
-            log.exception("Runner failed: org=%s job_id=%d image=%s", org, job_id, image)
+            log.exception("Runner start failed: org=%s job_id=%d image=%s", org, job_id, image)
+            return
+
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, container.wait),
+                timeout=RUNNER_TIMEOUT,
+            )
+            log.info("Runner finished: org=%s job_id=%d exit=%d", org, job_id, result.get("StatusCode", -1))
+        except asyncio.TimeoutError:
+            log.warning("Runner timed out after %ds: org=%s job_id=%d — killing", RUNNER_TIMEOUT, org, job_id)
+            await loop.run_in_executor(None, container.kill)
+        except Exception:
+            log.exception("Runner wait failed: org=%s job_id=%d", org, job_id)
+        finally:
+            try:
+                await loop.run_in_executor(None, lambda: container.remove(force=True))
+            except Exception:
+                pass
