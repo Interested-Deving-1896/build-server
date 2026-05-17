@@ -22,6 +22,13 @@ sem = asyncio.Semaphore(MAX_RUNNERS)
 DEFAULT_IMAGE = os.environ["DEFAULT_RUNNER_IMAGE"]
 ALLOWED_ORGS: set[str] = set(filter(None, os.getenv("ALLOWED_ORGS", "").split(",")))
 
+# Jobs targeting GitHub-hosted runners only — no point spawning a self-hosted runner
+_GITHUB_HOSTED = {
+    "ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-20.04", "ubuntu-18.04",
+    "windows-latest", "windows-2022", "windows-2019",
+    "macos-latest", "macos-14", "macos-13", "macos-12",
+}
+
 log.info(
     "Build server starting: MAX_RUNNERS=%d DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
     MAX_RUNNERS, DEFAULT_IMAGE, ALLOWED_ORGS or "unrestricted",
@@ -61,7 +68,7 @@ async def webhook(request: Request):
         log.warning("Ignored job from unlisted org=%s job_id=%d", org, job_id)
         return {"ok": True}
 
-    if "self-hosted" not in labels:
+    if all(lbl in _GITHUB_HOSTED for lbl in labels):
         return {"ok": True}
 
     log.info("Job queued: org=%s job_id=%d labels=%s", org, job_id, labels)
@@ -80,12 +87,14 @@ async def spawn_runner(installation_id: int, org: str, labels: list[str], job_id
             return
 
         image = _parse_image(labels)
+        custom_labels = [lbl for lbl in labels if not lbl.startswith("runner-image:") and lbl not in _GITHUB_HOSTED]
         env = {
             "RUNNER_SCOPE": "org",
             "ORG_NAME": org,
             "ACCESS_TOKEN": token,
             "EPHEMERAL": "true",
             "DISABLE_AUTO_UPDATE": "true",
+            "LABELS": ",".join(custom_labels),
         }
 
         loop = asyncio.get_event_loop()
