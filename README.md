@@ -4,53 +4,53 @@ Shared GitHub Actions runner pool for self-hosted CI on a single VPS.
 
 ## How it works
 
-- A GitHub App receives `workflow_job.queued` webhooks from any installed org
-- For each queued job, an ephemeral Docker container is spawned on the VPS
+- An org-level GitHub webhook fires `workflow_job.queued` for every queued job
+- The build server spawns an ephemeral Docker container as a self-hosted runner for that org
 - Concurrency is bounded by `MAX_RUNNERS` (defaults to `os.cpu_count()`)
-- Containers use the `myoung34/github-runner` image by default, or a custom image specified via label
+- All orgs share the same pool — idle capacity is never wasted on one org while another is busy
 
 ## Runner image per job
 
-To use a custom runner image, add a `runner-image:` label to `runs-on`:
+Add a `runner-image:` label to `runs-on` to use a custom image:
 
 ```yaml
 runs-on: [self-hosted, runner-image:ghcr.io/my-org/my-runner:latest]
 ```
 
-The build server parses the `runner-image:` prefix and spawns that image. Jobs without this label use `DEFAULT_RUNNER_IMAGE` from `.env`.
+Jobs without this label use `DEFAULT_RUNNER_IMAGE` from `.env`.
 
 ## Setup
 
-### 1. Create the GitHub App
-
-Go to https://github.com/settings/apps/new and configure:
-
-- **Webhook URL**: `http://<VPS-IP>/webhook`
-- **Webhook secret**: generate a random string, save to `.env`
-- **Organization permissions**: Self-hosted runners → Read & write
-- **Subscribe to events**: Workflow jobs
-
-After creation:
-- Note the **App ID**
-- Generate a **private key** (PEM file)
-- Install the App on each org that should use this runner pool
-
-### 2. Provision the VPS
+### 1. VPS provisioning
 
 ```bash
 ssh root@<VPS-IP>
 curl -fsSL https://raw.githubusercontent.com/jakwuh/build-server/main/setup.sh | bash
 cp /opt/build-server/.env.example /opt/build-server/.env
-# Edit .env with your App ID, private key, webhook secret
+# Edit .env — set GITHUB_PAT and WEBHOOK_SECRET
 systemctl start build-server
 systemctl status build-server
 ```
 
+### 2. Connect an org
+
+Create an org-level webhook (run once per org):
+
+```bash
+gh api --method POST /orgs/{ORG}/hooks \
+  --field name=web \
+  --field active=true \
+  --field events='["workflow_job"]' \
+  --field config[url]="http://<VPS-IP>/webhook" \
+  --field config[content_type]=json \
+  --field config[secret]="<WEBHOOK_SECRET from .env>"
+```
+
 ### 3. Add more orgs
 
-Install the GitHub App on the new org — that's it. No server config changes needed.
+Repeat step 2 for each new org — no server config changes needed.
 
 ## Tuning concurrency
 
 The default (`os.cpu_count()`) works well for CPU-bound builds.
-For memory-heavy builds, set `MAX_RUNNERS=floor(RAM_GB / peak_job_GB)` in `.env`.
+For memory-heavy builds: `MAX_RUNNERS=floor(RAM_GB / peak_job_GB)`.
