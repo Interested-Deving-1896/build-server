@@ -20,8 +20,12 @@ gi = GithubIntegration(os.environ["GITHUB_APP_ID"], _private_key)
 MAX_RUNNERS = int(os.getenv("MAX_RUNNERS") or os.cpu_count())
 sem = asyncio.Semaphore(MAX_RUNNERS)
 DEFAULT_IMAGE = os.environ["DEFAULT_RUNNER_IMAGE"]
+ALLOWED_ORGS: set[str] = set(filter(None, os.getenv("ALLOWED_ORGS", "").split(",")))
 
-log.info("Build server starting: MAX_RUNNERS=%d DEFAULT_IMAGE=%s", MAX_RUNNERS, DEFAULT_IMAGE)
+log.info(
+    "Build server starting: MAX_RUNNERS=%d DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
+    MAX_RUNNERS, DEFAULT_IMAGE, ALLOWED_ORGS or "unrestricted",
+)
 
 
 def _parse_image(labels: list[str]) -> str:
@@ -52,6 +56,10 @@ async def webhook(request: Request):
     org = payload["repository"]["owner"]["login"]
     labels: list[str] = payload["workflow_job"].get("labels", [])
     job_id = payload["workflow_job"]["id"]
+
+    if ALLOWED_ORGS and org not in ALLOWED_ORGS:
+        log.warning("Ignored job from unlisted org=%s job_id=%d", org, job_id)
+        return {"ok": True}
 
     log.info("Job queued: org=%s job_id=%d labels=%s", org, job_id, labels)
     asyncio.create_task(spawn_runner(installation_id, org, labels, job_id))
