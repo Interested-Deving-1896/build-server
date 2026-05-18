@@ -22,36 +22,45 @@ _app_id = int(os.environ["GITHUB_APP_ID"])
 gi = GithubIntegration(_app_id, _private_key)
 
 MAX_RUNNERS = int(os.getenv("MAX_RUNNERS") or os.cpu_count())
-# Seconds a runner may sit idle ("Listening for Jobs") without ever picking
-# up a job before it is killed — catches runners that registered with wrong
-# labels and will never receive work.
 RUNNER_IDLE_TIMEOUT = int(os.getenv("RUNNER_IDLE_TIMEOUT", "600"))
-# Max seconds a runner may spend executing a job once it has started. Long
-# CI jobs (migrations + seed + integration tests) legitimately exceed 10 min;
-# GitHub's own default job timeout is 6 h, so this is a generous safety net.
 RUNNER_JOB_TIMEOUT = int(os.getenv("RUNNER_JOB_TIMEOUT", "7200"))
-# How often (s) to poll a running container's status and logs.
 RUNNER_POLL_INTERVAL = int(os.getenv("RUNNER_POLL_INTERVAL", "15"))
+# Alert via Telegram if a runner hasn't picked up a job within this many seconds.
+RUNNER_IDLE_ALERT_SECS = int(os.getenv("RUNNER_IDLE_ALERT_SECS", "300"))
 sem = asyncio.Semaphore(MAX_RUNNERS)
 DEFAULT_IMAGE = os.environ["DEFAULT_RUNNER_IMAGE"]
 ALLOWED_ORGS: set[str] = set(filter(None, os.getenv("ALLOWED_ORGS", "").split(",")))
+# Master mode: set SLAVE_URL to forward overflow jobs to the slave server.
+SLAVE_URL = os.getenv("SLAVE_URL", "").rstrip("/")
 
-# Labels used exclusively by GitHub-hosted runners — skip spawning for these.
+_TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+_TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+
 _GITHUB_HOSTED = {
     "ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-20.04", "ubuntu-18.04",
     "windows-latest", "windows-2022", "windows-2019",
     "macos-latest", "macos-14", "macos-13", "macos-12",
 }
-
-# OS labels indicating a platform-specific pre-registered runner — do not spawn.
-# "Windows" and "macOS" are the OS labels GitHub assigns when a runner's OS is
-# detected; a Linux VPS can never serve these jobs.
 _NON_LINUX_OS = {"Windows", "macOS"}
 
 log.info(
-    "Build server starting: MAX_RUNNERS=%d IDLE_TIMEOUT=%ds JOB_TIMEOUT=%ds DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
+    "Build server starting: mode=%s MAX_RUNNERS=%d IDLE_TIMEOUT=%ds JOB_TIMEOUT=%ds DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
+    "master" if SLAVE_URL else "slave/standalone",
     MAX_RUNNERS, RUNNER_IDLE_TIMEOUT, RUNNER_JOB_TIMEOUT, DEFAULT_IMAGE, ALLOWED_ORGS or "unrestricted",
 )
+
+
+def _tg_notify(text: str) -> None:
+    if not _TG_TOKEN or not _TG_CHAT:
+        return
+    try:
+        _requests.post(
+            f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage",
+            json={"chat_id": _TG_CHAT, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception:
+        log.exception("Telegram notification failed")
 
 
 def _parse_image(labels: list[str]) -> str:
@@ -69,7 +78,6 @@ def _verify_signature(body: bytes, header: str) -> None:
 
 
 def _resolve_installation_id(org: str, owner_type: str) -> int | None:
-    """Look up the GitHub App installation ID for an org/user via the App API."""
     now = int(time.time())
     token = _jwt.encode({"iat": now - 60, "exp": now + 600, "iss": str(_app_id)}, _private_key, algorithm="RS256")
     segment = "users" if owner_type == "User" else "orgs"
@@ -83,6 +91,12 @@ def _resolve_installation_id(org: str, owner_type: str) -> int | None:
         return resp.json()["id"]
     log.warning("Installation lookup failed for org=%s: %s", org, resp.text[:200])
     return None
+
+
+@app.get("/capacity")
+async def capacity():
+    active = MAX_RUNNERS - sem._value  # noqa: SLF001
+    return {"active": active, "max": MAX_RUNNERS, "available": sem._value}
 
 
 @app.post("/webhook")
@@ -120,8 +134,33 @@ async def webhook(request: Request):
         return {"ok": True}
 
     log.info("Job queued: org=%s job_id=%d labels=%s", org, job_id, labels)
+
+    # Master mode: if we're at capacity, forward to slave.
+    if SLAVE_URL and sem._value == 0:  # noqa: SLF001
+        log.info("Master full, forwarding job to slave: org=%s job_id=%d", org, job_id)
+        asyncio.create_task(_forward_to_slave(body, request.headers))
+        return {"ok": True}
+
     asyncio.create_task(spawn_runner(installation_id, org, owner_type, repo_full_name, labels, job_id))
     return {"ok": True}
+
+
+async def _forward_to_slave(body: bytes, headers) -> None:
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, lambda: _requests.post(
+            f"{SLAVE_URL}/webhook",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": headers.get("x-hub-signature-256", ""),
+                "X-GitHub-Event": headers.get("x-github-event", "workflow_job"),
+            },
+            timeout=10,
+        ))
+        log.info("Forwarded job to slave: %s", SLAVE_URL)
+    except Exception:
+        log.exception("Failed to forward job to slave %s", SLAVE_URL)
 
 
 async def spawn_runner(
@@ -141,7 +180,6 @@ async def spawn_runner(
         custom_labels = [lbl for lbl in labels if lbl not in _GITHUB_HOSTED]
 
         if owner_type == "User":
-            # Personal accounts don't have org-level runners — register at repo scope.
             env = {
                 "RUNNER_SCOPE": "repo",
                 "REPO_URL": f"https://github.com/{repo_full_name}",
@@ -175,13 +213,9 @@ async def spawn_runner(
             log.exception("Runner start failed: org=%s job_id=%d image=%s", org, job_id, image)
             return
 
-        # Poll the container: distinguish an idle runner (registered with the
-        # wrong labels, will never get a job) from one actively executing a
-        # long job. Idle runners are killed quickly; working runners get a
-        # generous job timeout. Ephemeral runners exit on their own once the
-        # single job completes, so the happy path ends via the status check.
         start = asyncio.get_event_loop().time()
         job_started_at: float | None = None
+        idle_alerted = False
         try:
             while True:
                 await asyncio.sleep(RUNNER_POLL_INTERVAL)
@@ -199,6 +233,7 @@ async def spawn_runner(
                     break
 
                 now = asyncio.get_event_loop().time()
+                elapsed = now - start
                 if job_started_at is None:
                     try:
                         logs = await loop.run_in_executor(
@@ -209,13 +244,25 @@ async def spawn_runner(
                     if "Running job:" in logs:
                         job_started_at = now
                         log.info("Runner picked up job: org=%s job_id=%d", org, job_id)
-                    elif now - start > RUNNER_IDLE_TIMEOUT:
-                        log.warning(
-                            "Runner idle %ds without a job: org=%s job_id=%d — killing",
-                            RUNNER_IDLE_TIMEOUT, org, job_id,
-                        )
-                        await loop.run_in_executor(None, container.kill)
-                        break
+                    else:
+                        if not idle_alerted and elapsed >= RUNNER_IDLE_ALERT_SECS:
+                            idle_alerted = True
+                            msg = (
+                                f"⚠️ <b>Build server alert</b>\n"
+                                f"Runner for <code>{org}</code> job <code>{job_id}</code> "
+                                f"has been idle {int(elapsed)}s without picking up a job.\n"
+                                f"Labels: <code>{', '.join(labels)}</code>\n"
+                                f"Image: <code>{image}</code>"
+                            )
+                            log.warning("Sending idle alert: org=%s job_id=%d elapsed=%ds", org, job_id, int(elapsed))
+                            await loop.run_in_executor(None, lambda: _tg_notify(msg))
+                        if elapsed > RUNNER_IDLE_TIMEOUT:
+                            log.warning(
+                                "Runner idle %ds without a job: org=%s job_id=%d — killing",
+                                RUNNER_IDLE_TIMEOUT, org, job_id,
+                            )
+                            await loop.run_in_executor(None, container.kill)
+                            break
                 elif now - job_started_at > RUNNER_JOB_TIMEOUT:
                     log.warning(
                         "Job exceeded %ds: org=%s job_id=%d — killing",
