@@ -13,8 +13,7 @@ import docker
 from fastapi import FastAPI, Header, HTTPException, Request
 
 from ._common import (
-    GITHUB_HOSTED, INTERNAL_SECRET, generate_jit_config, gi, installation_token,
-    log, mem_available_mb,
+    GITHUB_HOSTED, INTERNAL_SECRET, gi, installation_token, log, mem_available_mb,
 )
 
 # ---------- Config ----------
@@ -187,28 +186,32 @@ async def _spawn_container(job: dict) -> None:
             await _requeue_failed(job, "no github app")
             return
         try:
-            itoken = installation_token(installation_id)
+            token = installation_token(installation_id)
         except Exception:
             log.exception("Failed to mint installation token (installation_id=%s)", installation_id)
             await _requeue_failed(job, "token fetch failed")
             return
 
         image = _parse_image(labels)
-        # Strip GitHub-hosted markers; pass the rest as JIT-runner labels.
         custom_labels = [lbl for lbl in labels if lbl not in GITHUB_HOSTED]
-        # JIT requires linux/x64 by default to satisfy GitHub's matching for
-        # most workflow_jobs that don't explicitly set them.
-        for lbl in ("self-hosted", "Linux", "X64"):
-            if lbl not in custom_labels:
-                custom_labels.append(lbl)
-        target = repo_full_name if owner_type == "User" else org
-        runner_name = f"jit-{job_id}-{int(asyncio.get_event_loop().time() * 1000) % 1_000_000_000}"
-        try:
-            jit_config = generate_jit_config(itoken, owner_type, target, runner_name, custom_labels)
-        except Exception:
-            log.exception("JIT config generation failed: org=%s job_id=%s", org, job_id)
-            await _requeue_failed(job, "jitconfig failed")
-            return
+        if owner_type == "User":
+            env = {
+                "RUNNER_SCOPE": "repo",
+                "REPO_URL": f"https://github.com/{repo_full_name}",
+                "ACCESS_TOKEN": token,
+                "EPHEMERAL": "true",
+                "DISABLE_AUTO_UPDATE": "true",
+                "LABELS": ",".join(custom_labels),
+            }
+        else:
+            env = {
+                "RUNNER_SCOPE": "org",
+                "ORG_NAME": org,
+                "ACCESS_TOKEN": token,
+                "EPHEMERAL": "true",
+                "DISABLE_AUTO_UPDATE": "true",
+                "LABELS": ",".join(custom_labels),
+            }
 
         loop = asyncio.get_event_loop()
         try:
@@ -220,12 +223,7 @@ async def _spawn_container(job: dict) -> None:
                         detach=True,
                         user="root",
                         volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
-                        environment={"JIT_CONFIG": jit_config},
-                        # Bypass the image's default entrypoint (which wants
-                        # ACCESS_TOKEN / RUNNER_TOKEN and runs ./config.sh).
-                        # JIT registration uses ./run.sh --jitconfig directly.
-                        entrypoint=["/bin/bash", "-c"],
-                        command=['cd /actions-runner && exec ./run.sh --jitconfig "$JIT_CONFIG"'],
+                        environment=env,
                     ),
                 )
         except Exception:
@@ -233,9 +231,9 @@ async def _spawn_container(job: dict) -> None:
             await _requeue_failed(job, "dockerd error")
             return
 
-        # Watchdog loop: JIT runners are bound to exactly this job_id, so
-        # "Running job:" in container logs definitively means our job started.
-        # No org-pool race.
+        # Watchdog loop: track when container picks up *a* job (org-scoped pool
+        # means it might not be the one we spawned for, that's fine) and kill
+        # runaway containers.
         start = asyncio.get_event_loop().time()
         job_started_at: float | None = None
         while True:
@@ -261,13 +259,10 @@ async def _spawn_container(job: dict) -> None:
                     logs = ""
                 if "Running job:" in logs:
                     job_started_at = now
-                    log.info("Runner picked up job: org=%s job_id=%s", org, job_id)
+                    log.info("Runner picked up job: org=%s spawned_for=%s", org, job_id)
                 elif elapsed > RUNNER_IDLE_TIMEOUT:
-                    # With JIT the runner is bound to this exact job; if it
-                    # hasn't started in 10 min something is wrong (GitHub
-                    # cancelled, network issue, etc.). Reap the container.
-                    log.warning(
-                        "JIT runner idle %ds without job start: org=%s job_id=%s — killing",
+                    log.info(
+                        "Runner idle %ds without a job: org=%s spawned_for=%s — killing (lost org-pool race)",
                         RUNNER_IDLE_TIMEOUT, org, job_id,
                     )
                     await loop.run_in_executor(None, container.kill)

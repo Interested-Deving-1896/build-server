@@ -54,43 +54,6 @@ def installation_token(installation_id: int) -> str:
     return gi.get_access_token(installation_id).token
 
 
-def generate_jit_config(
-    itoken: str, owner_type: str, org_or_repo: str,
-    name: str, labels: list[str], runner_group_id: int = 1,
-) -> str:
-    """Generate a Just-in-Time runner config for ONE specific job assignment.
-
-    Unlike a long-lived ephemeral runner registration (which joins the org pool
-    and runs any matching queued job FIFO), a JIT runner is bound to a single
-    job allocation. This eliminates the org-pool race that caused the entire
-    class of 'we spawned for X but our container served Y' bugs.
-
-    Returns base64-encoded jitconfig the runner agent uses via `./run.sh
-    --jitconfig <token>`.
-
-    https://docs.github.com/en/rest/actions/self-hosted-runners#create-configuration-for-a-just-in-time-runner-for-an-organization
-    """
-    if owner_type == "User":
-        # Repo-scoped JIT for personal accounts (no org runners API).
-        url = f"https://api.github.com/repos/{org_or_repo}/actions/runners/generate-jitconfig"
-    else:
-        url = f"https://api.github.com/orgs/{org_or_repo}/actions/runners/generate-jitconfig"
-    resp = _requests.post(
-        url,
-        headers={"Authorization": f"token {itoken}", "Accept": "application/vnd.github+json"},
-        json={
-            "name": name,
-            "runner_group_id": runner_group_id,
-            "labels": labels,
-            "work_folder": "_work",
-        },
-        timeout=10,
-    )
-    if not resp.ok:
-        raise RuntimeError(f"jitconfig generate failed: {resp.status_code} {resp.text[:300]}")
-    return resp.json()["encoded_jit_config"]
-
-
 # ---------- Telegram ----------
 _TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
