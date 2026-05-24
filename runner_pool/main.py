@@ -99,12 +99,26 @@ _job_queued_at: dict[tuple[str, int], float] = {}
 _job_alerted: set[tuple[str, int]] = set()
 _job_lock = asyncio.Lock()
 
-IS_MASTER = bool(SLAVE_URLS) or gi is not None
+# Worker health: track consecutive failed /capacity polls per slave URL. Fire
+# a Telegram alert when crossing the threshold so ops knows a worker is dead
+# (otherwise the only signal would be "fleet is mysteriously slower").
+WORKER_UNREACHABLE_THRESHOLD = 3
+_worker_failures: dict[str, int] = {}
+_worker_alerted: set[str] = set()
+
+# "Gateway" = the node that receives GitHub webhooks AND dispatches to other
+# nodes. GitHub config only points at the master URL, but `gi is not None` is
+# true on slaves too (they need the App to mint runner-registration tokens),
+# so that was the wrong signal for master-only loops. SLAVE_URLS is the real
+# marker: only a node configured with downstream slaves is the gateway, and
+# master-only loops (poller, SLA sweeper, queue drainer-with-dispatch) run
+# exclusively there.
+IS_GATEWAY = bool(SLAVE_URLS)
 
 log.info(
     "Build server starting: role=%s slaves=%d MIN_FREE_RAM=%dMB BURST_AT=%dMB "
     "DOCKER_SEM=%d JOB_TIMEOUT=%ds SLA_ALERT=%ds DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
-    "master" if IS_MASTER else "slave",
+    "gateway" if IS_GATEWAY else "worker",
     len(SLAVE_URLS), MIN_FREE_RAM_MB, 2 * MIN_FREE_RAM_MB,
     MAX_CONCURRENT_DOCKER_SPAWNS,
     RUNNER_JOB_TIMEOUT, LATENCY_ALERT_S,
@@ -199,6 +213,8 @@ async def capacity():
     snap = _local_capacity_snapshot()
     snap["pending"] = len(_pending)
     snap["docker_sem_in_flight"] = MAX_CONCURRENT_DOCKER_SPAWNS - _docker_spawn_sem._value  # noqa: SLF001
+    if IS_GATEWAY:
+        snap["unreachable_workers"] = sorted(_worker_alerted)
     return snap
 
 
@@ -304,25 +320,50 @@ def _commit_spawn(job: dict, reason: str) -> None:
 # ---------- Master-side routing ----------
 
 async def _worker_capacity(url: str) -> dict | None:
-    """Poll a single worker's /capacity. url='' means local. Returns None on failure."""
+    """Poll a single worker's /capacity. url='' means local. Returns None on failure.
+    Tracks consecutive failures per worker and fires a Telegram alert when a
+    worker is consistently unreachable (and a recovery alert when it returns)."""
     if not url:
         snap = _local_capacity_snapshot()
         snap["url"] = ""
         return snap
     loop = asyncio.get_event_loop()
+    data: dict | None = None
     try:
         resp = await loop.run_in_executor(
             None,
             lambda: _requests.get(f"{url}/capacity", timeout=WORKER_CAPACITY_TIMEOUT_S),
         )
-        if not resp.ok:
-            return None
-        data = resp.json()
-        data["url"] = url
-        return data
+        if resp.ok:
+            data = resp.json()
+            data["url"] = url
     except Exception:
         log.warning("Worker %s capacity poll failed", url)
-        return None
+    _record_worker_health(url, data is not None)
+    return data
+
+
+def _record_worker_health(url: str, ok: bool) -> None:
+    """Track consecutive capacity-poll failures and alert on transitions."""
+    if ok:
+        if _worker_failures.get(url, 0) >= WORKER_UNREACHABLE_THRESHOLD and url in _worker_alerted:
+            msg = f"✅ <b>Build server worker recovered</b>\nWorker <code>{url}</code> is responding again."
+            asyncio.create_task(asyncio.to_thread(_tg_notify, msg))
+            _worker_alerted.discard(url)
+        _worker_failures[url] = 0
+        return
+    n = _worker_failures.get(url, 0) + 1
+    _worker_failures[url] = n
+    if n == WORKER_UNREACHABLE_THRESHOLD and url not in _worker_alerted:
+        _worker_alerted.add(url)
+        msg = (
+            f"⚠️ <b>Build server worker unreachable</b>\n"
+            f"Worker <code>{url}</code> failed <b>{n}</b> consecutive "
+            f"capacity polls (>{WORKER_UNREACHABLE_THRESHOLD * QUEUE_POLL_INTERVAL_S // 60}m). "
+            f"Master is excluding it from dispatch — fix it or remove from SLAVE_URLS."
+        )
+        log.warning("Worker %s marked unreachable (n=%d)", url, n)
+        asyncio.create_task(asyncio.to_thread(_tg_notify, msg))
 
 
 async def _pick_worker_order() -> list[str]:
@@ -445,8 +486,10 @@ async def _start_background_tasks():
     # Drainer runs everywhere — slaves use it to retry their own _pending
     # after a spawn failure (dockerd timeout, image pull error, etc.).
     asyncio.create_task(_drain_pending())
-    # SLA tracking is master-only because GitHub webhooks only hit master.
-    if IS_MASTER:
+    # Gateway-only loops: SLA tracking (only gateway receives webhooks) and
+    # queue poller (would double-spawn if run on multiple nodes against the
+    # same org pool).
+    if IS_GATEWAY:
         asyncio.create_task(_latency_sweeper())
         if QUEUE_POLL_ENABLED and gi is not None and ALLOWED_ORGS:
             asyncio.create_task(_queue_poller())
