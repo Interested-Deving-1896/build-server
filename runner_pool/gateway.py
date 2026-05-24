@@ -426,11 +426,14 @@ async def _poll_queued_orphans() -> None:
                         continue
                     if any(lbl in NON_LINUX_OS for lbl in labels):
                         continue
+                    # NOTE: do NOT skip if `(org, job_id)` is already in
+                    # _job_queued_at. That map only proves the webhook arrived,
+                    # not that the job was actually served — under org-pool
+                    # semantics the runner we spawned for X may serve Y, leaving
+                    # X queued. GitHub still showing the job as queued (this
+                    # poll just confirmed it) means we need ANOTHER spawn.
+                    # Runner-side dedup (30s TTL) suppresses immediate retries.
                     key = (org, j["id"])
-                    async with _job_lock:
-                        already_tracked = key in _job_queued_at
-                    if already_tracked:
-                        continue
                     log.warning(
                         "Queue poller: orphan job org=%s job_id=%s name=%s age=%.0fs — synthesising spawn",
                         org, j["id"], j["name"], age,
