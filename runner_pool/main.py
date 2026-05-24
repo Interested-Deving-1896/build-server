@@ -95,8 +95,17 @@ _state_lock = asyncio.Lock()
 _last_spawn_at: float = 0.0
 _active_runners: int = 0
 
-# ---- Master state (unused on slaves) ----
-_pending: list[dict] = []  # FIFO of jobs awaiting capacity across the fleet
+# Cap concurrent docker.containers.run() calls. dockerd serializes API requests
+# at the unix socket; calling 80 spawns at once produces 60s ReadTimeouts and
+# silently-lost jobs. Defaults to vCPU count — a reasonable rate that keeps
+# dockerd responsive without throttling burst capacity in the common case.
+MAX_CONCURRENT_DOCKER_SPAWNS = int(
+    os.getenv("MAX_CONCURRENT_DOCKER_SPAWNS") or (os.cpu_count() or 4)
+)
+_docker_spawn_sem = asyncio.Semaphore(MAX_CONCURRENT_DOCKER_SPAWNS)
+
+# ---- FIFO of jobs awaiting capacity. Used on every node (drainer below) ----
+_pending: list[dict] = []
 # SLA tracking: (org, job_id) -> monotonic_time when workflow_job.queued arrived.
 # Cleared on workflow_job.in_progress (success: latency computed) or .completed.
 # Sweeper alerts on entries older than LATENCY_ALERT_S.
@@ -108,9 +117,11 @@ IS_MASTER = bool(SLAVE_URLS) or gi is not None
 
 log.info(
     "Build server starting: role=%s slaves=%d MIN_FREE_RAM=%dMB WORST_CASE_RUNNER=%dMB "
-    "COOLDOWN=%ds IDLE_TIMEOUT=%ds JOB_TIMEOUT=%ds SLA_ALERT=%ds QUEUE_POLL=%s DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
+    "COOLDOWN=%ds DOCKER_SEM=%d IDLE_TIMEOUT=%ds JOB_TIMEOUT=%ds SLA_ALERT=%ds QUEUE_POLL=%s "
+    "DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
     "master" if IS_MASTER else "slave",
     len(SLAVE_URLS), MIN_FREE_RAM_MB, WORST_CASE_RUNNER_MB, SPAWN_COOLDOWN_S,
+    MAX_CONCURRENT_DOCKER_SPAWNS,
     RUNNER_IDLE_TIMEOUT, RUNNER_JOB_TIMEOUT, LATENCY_ALERT_S,
     f"{QUEUE_POLL_INTERVAL_S}s" if QUEUE_POLL_ENABLED else "off",
     DEFAULT_IMAGE, ALLOWED_ORGS or "unrestricted",
@@ -180,7 +191,8 @@ def _local_capacity_snapshot() -> dict:
 @app.get("/capacity")
 async def capacity():
     snap = _local_capacity_snapshot()
-    snap["pending"] = len(_pending) if IS_MASTER else 0
+    snap["pending"] = len(_pending)
+    snap["docker_sem_in_flight"] = MAX_CONCURRENT_DOCKER_SPAWNS - _docker_spawn_sem._value  # noqa: SLF001
     return snap
 
 
@@ -422,8 +434,11 @@ async def _drain_once() -> None:
 
 @app.on_event("startup")
 async def _start_background_tasks():
+    # Drainer runs everywhere — slaves use it to retry their own _pending
+    # after a spawn failure (dockerd timeout, image pull error, etc.).
+    asyncio.create_task(_drain_pending())
+    # SLA tracking is master-only because GitHub webhooks only hit master.
     if IS_MASTER:
-        asyncio.create_task(_drain_pending())
         asyncio.create_task(_latency_sweeper())
         if QUEUE_POLL_ENABLED and gi is not None and ALLOWED_ORGS:
             asyncio.create_task(_queue_poller())
@@ -552,6 +567,20 @@ async def _poll_queued_orphans() -> None:
             log.exception("Queue poller failed for org=%s", org)
 
 
+async def _requeue_failed(job: dict, reason: str) -> None:
+    """Spawn failed (token/dockerd error). Put the job back into _pending so the
+    drainer retries it on the next tick. Decrement _active_runners since the
+    spawn was committed but never produced a live container."""
+    global _active_runners
+    async with _state_lock:
+        _active_runners -= 1
+        _pending.append(job)
+        log.warning(
+            "Re-queued failed spawn: org=%s job_id=%s reason='%s' pending=%d",
+            job["org"], job["job_id"], reason, len(_pending),
+        )
+
+
 # ---------- SLA latency tracking ----------
 
 async def _track_job_event(org: str, job_id: int, action: str) -> None:
@@ -673,11 +702,13 @@ async def spawn_runner(job: dict) -> None:
         # configured. If neither — fail loudly.
         if gi is None:
             log.error("Cannot spawn: no GitHub App on this node (org=%s job_id=%s)", org, job_id)
+            await _requeue_failed(job, "no github app")
             return
         try:
             token = gi.get_access_token(installation_id).token
         except Exception:
             log.exception("Failed to get installation token for installation_id=%s", installation_id)
+            await _requeue_failed(job, "token fetch failed")
             return
 
         image = _parse_image(labels)
@@ -703,19 +734,23 @@ async def spawn_runner(job: dict) -> None:
             }
 
         loop = asyncio.get_event_loop()
+        # Rate-limit concurrent docker.containers.run() to keep dockerd from
+        # serializing 80+ calls into 60s ReadTimeouts.
         try:
-            container = await loop.run_in_executor(
-                None,
-                lambda: docker_client.containers.run(
-                    image,
-                    detach=True,
-                    user="root",
-                    volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
-                    environment=env,
-                ),
-            )
+            async with _docker_spawn_sem:
+                container = await loop.run_in_executor(
+                    None,
+                    lambda: docker_client.containers.run(
+                        image,
+                        detach=True,
+                        user="root",
+                        volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
+                        environment=env,
+                    ),
+                )
         except Exception:
-            log.exception("Runner start failed: org=%s job_id=%s image=%s", org, job_id, image)
+            log.exception("Runner start failed: org=%s job_id=%s image=%s — requeueing", org, job_id, image)
+            await _requeue_failed(job, "dockerd error")
             return
 
         start = asyncio.get_event_loop().time()
@@ -768,11 +803,14 @@ async def spawn_runner(job: dict) -> None:
     except Exception:
         log.exception("Runner wait failed: org=%s job_id=%s", org, job_id)
     finally:
+        # _active_runners was +1 in _commit_spawn. If we failed BEFORE creating
+        # a container, _requeue_failed already did the -1. Only decrement here
+        # when we got far enough to actually start a container.
         if container is not None:
             try:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, lambda: container.remove(force=True))
             except Exception:
                 pass
-        async with _state_lock:
-            _active_runners -= 1
+            async with _state_lock:
+                _active_runners -= 1
