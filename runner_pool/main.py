@@ -65,6 +65,17 @@ LATENCY_SWEEP_INTERVAL_S = int(os.getenv("LATENCY_SWEEP_INTERVAL_S", "30"))
 # Drop tracking entries older than this so memory doesn't grow unbounded.
 LATENCY_TRACK_TTL_S = int(os.getenv("LATENCY_TRACK_TTL_S", "3600"))
 
+# Queue poller (master only). The build server is purely event-driven by GitHub
+# webhooks: 1 webhook → 1 spawn. If a webhook is lost OR our spawned runner is
+# assigned a different job by the org pool, the original job sits in GitHub's
+# queue forever — we'll never get a second chance to know about it. The poller
+# periodically scans GitHub's queued jobs for each ALLOWED_ORG and synthesises
+# a spawn for anything that's been queued > QUEUE_POLL_AGE_THRESHOLD_S and isn't
+# already tracked. Self-correcting; eventually drains any backlog.
+QUEUE_POLL_INTERVAL_S = int(os.getenv("QUEUE_POLL_INTERVAL_S", "60"))
+QUEUE_POLL_AGE_THRESHOLD_S = int(os.getenv("QUEUE_POLL_AGE_THRESHOLD_S", "60"))
+QUEUE_POLL_ENABLED = os.getenv("QUEUE_POLL_ENABLED", "1") not in ("0", "false", "False", "")
+
 DEFAULT_IMAGE = os.environ["DEFAULT_RUNNER_IMAGE"]
 ALLOWED_ORGS: set[str] = set(filter(None, os.getenv("ALLOWED_ORGS", "").split(",")))
 
@@ -97,11 +108,12 @@ IS_MASTER = bool(SLAVE_URLS) or gi is not None
 
 log.info(
     "Build server starting: role=%s slaves=%d MIN_FREE_RAM=%dMB WORST_CASE_RUNNER=%dMB "
-    "COOLDOWN=%ds IDLE_TIMEOUT=%ds JOB_TIMEOUT=%ds SLA_ALERT=%ds DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
+    "COOLDOWN=%ds IDLE_TIMEOUT=%ds JOB_TIMEOUT=%ds SLA_ALERT=%ds QUEUE_POLL=%s DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
     "master" if IS_MASTER else "slave",
     len(SLAVE_URLS), MIN_FREE_RAM_MB, WORST_CASE_RUNNER_MB, SPAWN_COOLDOWN_S,
-    RUNNER_IDLE_TIMEOUT, RUNNER_JOB_TIMEOUT, LATENCY_ALERT_S, DEFAULT_IMAGE,
-    ALLOWED_ORGS or "unrestricted",
+    RUNNER_IDLE_TIMEOUT, RUNNER_JOB_TIMEOUT, LATENCY_ALERT_S,
+    f"{QUEUE_POLL_INTERVAL_S}s" if QUEUE_POLL_ENABLED else "off",
+    DEFAULT_IMAGE, ALLOWED_ORGS or "unrestricted",
 )
 
 
@@ -413,6 +425,131 @@ async def _start_background_tasks():
     if IS_MASTER:
         asyncio.create_task(_drain_pending())
         asyncio.create_task(_latency_sweeper())
+        if QUEUE_POLL_ENABLED and gi is not None and ALLOWED_ORGS:
+            asyncio.create_task(_queue_poller())
+
+
+# ---------- Queue poller (master only) ----------
+
+async def _queue_poller() -> None:
+    """Periodically scan GitHub for queued jobs we haven't seen via webhooks
+    and synthesize spawns for them. Self-healing against webhook loss and
+    org-pool races where our runners get assigned different jobs."""
+    log.info("Queue poller started: every %ds, age>%ds, orgs=%s",
+             QUEUE_POLL_INTERVAL_S, QUEUE_POLL_AGE_THRESHOLD_S, ALLOWED_ORGS)
+    while True:
+        await asyncio.sleep(QUEUE_POLL_INTERVAL_S)
+        try:
+            await _poll_queued_orphans()
+        except Exception:
+            log.exception("queue poller iteration failed")
+
+
+def _gh_get(url: str, itoken: str) -> dict | list | None:
+    try:
+        r = _requests.get(
+            url,
+            headers={"Authorization": f"token {itoken}", "Accept": "application/vnd.github+json"},
+            timeout=10,
+        )
+        if not r.ok:
+            log.warning("Queue poller GET %s → %d %s", url, r.status_code, r.text[:200])
+            return None
+        return r.json()
+    except Exception:
+        log.exception("Queue poller GET %s failed", url)
+        return None
+
+
+def _list_installation_repos(itoken: str) -> list[str]:
+    data = _gh_get("https://api.github.com/installation/repositories?per_page=100", itoken)
+    if not data:
+        return []
+    return [r["full_name"] for r in data.get("repositories", [])]
+
+
+def _list_repo_queued_jobs(itoken: str, repo: str) -> list[dict]:
+    """Returns dicts with id, name, labels, created_at, run_id."""
+    out: list[dict] = []
+    runs = _gh_get(f"https://api.github.com/repos/{repo}/actions/runs?status=queued&per_page=30", itoken)
+    if not runs:
+        return out
+    for run in runs.get("workflow_runs", []):
+        jobs = _gh_get(f"https://api.github.com/repos/{repo}/actions/runs/{run['id']}/jobs", itoken)
+        if not jobs:
+            continue
+        for j in jobs.get("jobs", []):
+            if j.get("status") == "queued":
+                out.append({
+                    "id": j["id"],
+                    "name": j.get("name", ""),
+                    "labels": j.get("labels", []),
+                    "created_at": j.get("created_at", ""),
+                    "run_id": run["id"],
+                })
+    return out
+
+
+def _iso_age_s(iso: str) -> float:
+    if not iso:
+        return 0.0
+    try:
+        from datetime import datetime, timezone
+        ts = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception:
+        return 0.0
+
+
+async def _poll_queued_orphans() -> None:
+    loop = asyncio.get_event_loop()
+    for org in ALLOWED_ORGS:
+        try:
+            inst_id = await loop.run_in_executor(None, lambda o=org: _resolve_installation_id(o, "Organization"))
+            if not inst_id:
+                continue
+            try:
+                itoken = await loop.run_in_executor(None, lambda iid=inst_id: gi.get_access_token(iid).token)
+            except Exception:
+                log.exception("Queue poller: token fetch failed for org=%s", org)
+                continue
+            repos = await loop.run_in_executor(None, lambda t=itoken: _list_installation_repos(t))
+            for repo in repos:
+                jobs = await loop.run_in_executor(None, lambda t=itoken, r=repo: _list_repo_queued_jobs(t, r))
+                for j in jobs:
+                    age = _iso_age_s(j["created_at"])
+                    if age < QUEUE_POLL_AGE_THRESHOLD_S:
+                        continue
+                    labels = j["labels"]
+                    # Skip github-hosted-only jobs (we don't serve those).
+                    if all(lbl in _GITHUB_HOSTED for lbl in labels):
+                        continue
+                    if any(lbl in _NON_LINUX_OS for lbl in labels):
+                        continue
+                    key = (org, j["id"])
+                    async with _job_lock:
+                        already_tracked = key in _job_queued_at
+                    if already_tracked:
+                        continue
+                    log.warning(
+                        "Queue poller: orphan job org=%s job_id=%s name=%s age=%.0fs labels=%s — synthesizing spawn",
+                        org, j["id"], j["name"], age, labels,
+                    )
+                    fake_job = {
+                        "installation_id": inst_id,
+                        "org": org,
+                        "owner_type": "Organization",
+                        "repo_full_name": repo,
+                        "labels": labels,
+                        "job_id": j["id"],
+                        "enqueued_at": asyncio.get_event_loop().time(),
+                    }
+                    # Register in SLA tracker so the in_progress webhook clears it.
+                    async with _job_lock:
+                        _job_queued_at.setdefault(key, asyncio.get_event_loop().time())
+                    asyncio.create_task(_route(fake_job))
+        except Exception:
+            log.exception("Queue poller failed for org=%s", org)
 
 
 # ---------- SLA latency tracking ----------
