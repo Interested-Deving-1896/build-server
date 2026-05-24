@@ -1,46 +1,51 @@
 # build-server
 
-Shared GitHub Actions runner pool across one or more VPS nodes, with RAM-aware scheduling.
+Shared GitHub Actions runner pool. Two components, mix and match per host.
 
-## How it works
+## Architecture
 
 ```
-GitHub ──webhook──► MASTER ──┬── spawn locally (if it has the most free RAM)
-                             │
-                             ├── POST /spawn → slave-1
-                             │
-                             └── POST /spawn → slave-N
+GitHub ──webhook──► GATEWAY ──┬── POST /spawn → RUNNER (local, 127.0.0.1:3001)
+                              │
+                              ├── POST /spawn → RUNNER on box-2
+                              │
+                              └── POST /spawn → RUNNER on box-N
 ```
 
-- An org-level GitHub webhook fires `workflow_job.queued` for every queued job
-- **Master** is the only node GitHub talks to. It polls every worker's `/capacity` in parallel and dispatches the job to whichever node has the most free RAM (itself included).
-- **Slaves** expose only `/capacity` and `/spawn` (authenticated with `INTERNAL_SECRET`). They never see GitHub directly.
-- Each chosen worker re-checks its own capacity before accepting (race-safe) and either spawns or returns 503.
-- If the entire fleet returns 503, master holds the job in a pending queue, retries every 5s, and gives up after 1h.
+| Component | Role |
+|---|---|
+| **gateway** | Single GitHub webhook entry. Polls each runner's `/capacity` and dispatches each job to whichever has the most free RAM. Tracks per-job SLA (queued→in_progress latency, alerts on breach). Periodically scans GitHub for orphan queued jobs and synthesises spawns. |
+| **runner** | Exposes `/capacity` and `/spawn`. Spawns ephemeral `github-runner` containers, watchdogs them, re-queues failed spawns. RAM-gated scheduler + dockerd semaphore prevent OOM and webhook-stampede. |
 
-### Scheduler
+**Single-host deploy:** run both on the same machine. Gateway on `:3000`, runner on `:3001`, `WORKERS=http://127.0.0.1:3001`. nginx reverse-proxies port 80 → gateway.
 
-Concurrency on each node is gated by free RAM (`/proc/meminfo MemAvailable`), not a fixed runner count.
+**Multi-host deploy:** one gateway box, N runner boxes. Gateway's `WORKERS=http://runner-1,http://runner-2,...`.
+
+## Scheduler (runner-side)
 
 Single knob: `MIN_FREE_RAM_MB` (default 3072) — how much RAM to always keep free for OS + spike headroom.
 
 ```python
-avail = mem_available_mb() - inflight_reservation  # see below
-if avail < MIN_FREE_RAM_MB:                      return False   # refuse
-if avail >= 2 * MIN_FREE_RAM_MB:                 return True    # burst
-if (now - last_spawn_at) < SPAWN_COOLDOWN_S(15s): return False  # throttle
-return True                                                     # tight ok
+avail = mem_available_mb() - inflight_reservation
+if avail < MIN_FREE_RAM_MB:                       return False   # refuse
+if avail >= 2 * MIN_FREE_RAM_MB:                  return True    # burst
+if (now - last_spawn_at) < 15s:                    return False  # throttle (tight band)
+return True                                                      # tight ok
 ```
 
-| MemAvailable | behavior (default MIN=3072) |
+In-flight reservation: each recent spawn (last 60s) "owes" `MIN_FREE_RAM_MB` worth of allocation in the accounting. Prevents a webhook stampede from racing past the gate before kernel sees real allocation.
+
+Burst is also capped by a docker-daemon semaphore (= vCPU count) so `containers.run()` calls don't pile up at the unix socket.
+
+| MemAvailable (default MIN=3072) | behavior |
 |---|---|
-| < 3 GB | refuse → next worker / queue |
+| < 3 GB | refuse → next worker / gateway pending queue |
 | 3–6 GB | tight, 1 spawn / 15s |
 | ≥ 6 GB | burst freely |
 
-In-flight reservation: each recent spawn (within last 60s) "owes" `MIN_FREE_RAM_MB` worth of allocation in the accounting. Prevents a webhook stampede from racing past the RAM gate while containers haven't yet started consuming memory.
+## SLA alert (gateway-side)
 
-Burst is also capped by a docker-daemon semaphore (= vCPU count) so `containers.run()` calls don't pile up at the unix socket.
+Measures `queued → in_progress` per `(org, job_id)` from GitHub webhooks. Alerts once via Telegram if the gap exceeds `LATENCY_ALERT_S` (default 300s).
 
 ## Runner image per job
 
@@ -50,56 +55,50 @@ Add a `runner-image:` label to `runs-on` to use a custom image:
 runs-on: [self-hosted, runner-image:ghcr.io/my-org/my-runner:latest]
 ```
 
-Jobs without this label use `DEFAULT_RUNNER_IMAGE` from `.env`.
+Jobs without this label use `DEFAULT_RUNNER_IMAGE` from the runner's `.env`.
 
 ## Setup
 
-### 1. Provision each node (master + slaves) identically
+### 1. Provision each host
 
 ```bash
-ssh root@<NODE-IP>
+ssh root@<HOST-IP>
 curl -fsSL https://raw.githubusercontent.com/jakwuh/build-server/main/setup.sh | bash
 cp /opt/build-server/.env.example /opt/build-server/.env
-# Edit .env — GITHUB_APP_*, WEBHOOK_SECRET (master), INTERNAL_SECRET (all nodes, identical)
-systemctl start build-server
+# Fill in GITHUB_APP_*, WEBHOOK_SECRET (gateway), INTERNAL_SECRET, DEFAULT_RUNNER_IMAGE
 ```
 
-Every node needs GitHub App credentials (each mints its own installation token before spawning).
+`setup.sh` installs both `build-server-gateway.service` and `build-server-runner.service`. Disable whichever you don't want for this host.
 
-### 2. Wire master ↔ slaves
-
-On master, add to `/opt/build-server/.env`:
-```bash
-SLAVE_URLS=http://<slave-1-ip>,http://<slave-2-ip>
-```
-Restart master: `systemctl restart build-server`.
-
-### 3. Connect an org (master only)
+### 2a. Single-host (gateway + runner on one box)
 
 ```bash
-gh api --method POST /orgs/{ORG}/hooks \
-  --field name=web \
-  --field active=true \
-  --field events='["workflow_job"]' \
-  --field config[url]="http://<MASTER-IP>/webhook" \
-  --field config[content_type]=json \
-  --field config[secret]="<WEBHOOK_SECRET from master .env>"
+echo 'WORKERS=http://127.0.0.1:3001' >> /opt/build-server/.env
+systemctl start build-server-runner build-server-gateway
 ```
 
-Repeat per org. No GitHub config touches slaves — only master receives webhooks.
+### 2b. Multi-host (one gateway, N runners)
 
-### 4. Add a new slave later
+On the **gateway** host:
+```bash
+systemctl disable --now build-server-runner   # optional, if gateway shouldn't also run jobs
+echo 'WORKERS=http://runner-1.internal:3001,http://runner-2.internal:3001' >> /opt/build-server/.env
+systemctl start build-server-gateway
+```
 
-1. Provision the new node (step 1) with the same `INTERNAL_SECRET`.
-2. Append its URL to master's `SLAVE_URLS`.
-3. Restart master.
+On each **runner** host:
+```bash
+systemctl disable --now build-server-gateway  # runners don't talk to GitHub
+# Remove WEBHOOK_SECRET / WORKERS / LATENCY_ALERT_S / TELEGRAM_* from .env — runner-only.
+systemctl start build-server-runner
+```
 
-No changes needed in GitHub, no changes on existing slaves.
+### 3. Connect an org
+
+Point your GitHub App's webhook URL at `http://<GATEWAY-IP>/webhook`. Install the App on each org.
 
 ## Tuning
 
-Defaults are conservative for a 12 GB host with a mix of linux/android jobs.
-
 - **Lots of small linux jobs only?** Drop `MIN_FREE_RAM_MB` to ~1024 → higher density.
-- **Mostly android/e2e?** Raise to your largest-job peak (e.g. 4096). Tight band widens, throttling kicks in earlier.
-- **Host has lots of swap?** Don't lean on it — swap protects from OOM-kill but not from thrash. Treat swap as a safety net, keep `MIN_FREE_RAM_MB` realistic.
+- **Mostly android/e2e?** Raise to your largest-job peak (e.g. 4096).
+- **Host has swap?** Don't lean on it — swap protects from OOM-kill but not from thrash. Keep `MIN_FREE_RAM_MB` realistic.
