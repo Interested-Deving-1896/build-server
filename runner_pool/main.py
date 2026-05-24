@@ -30,52 +30,33 @@ else:
     _app_id = 0
     gi = None  # slave-only deployment
 
-# ---- Scheduler knobs (apply to every worker) ----
-# There is no fixed runner cap. Capacity is gated by free RAM.
+# ---------- Real config (env-tunable) ----------
+# Capacity gate. Single knob: how much RAM to always keep free for OS + spike
+# headroom. Burst threshold is implicitly 2 × this. Heuristic: worst-case
+# runner ≈ reserve floor. Bump for android/e2e hosts, drop on tiny VPSes.
 MIN_FREE_RAM_MB = int(os.getenv("MIN_FREE_RAM_MB", "3072"))
-WORST_CASE_RUNNER_MB = int(os.getenv("WORST_CASE_RUNNER_MB", "3072"))
-SPAWN_COOLDOWN_S = int(os.getenv("SPAWN_COOLDOWN_S", "15"))
-
-# ---- Master-only knobs ----
-# Pending queue lives on master. Slaves never queue — they accept or 503.
-PENDING_JOB_DEADLINE_S = int(os.getenv("PENDING_JOB_DEADLINE_S", "3600"))
-PENDING_DRAIN_INTERVAL_S = int(os.getenv("PENDING_DRAIN_INTERVAL_S", "5"))
-# Comma-separated URLs of slave workers. Master itself is always included as "local".
-# Empty (default) → standalone, no slaves.
+# Workload-specific upper bound on a single CI job (default 30 min):
+RUNNER_JOB_TIMEOUT = int(os.getenv("RUNNER_JOB_TIMEOUT", "1800"))
+# User-facing SLA: alert when commit→runner-pickup gap exceeds this:
+LATENCY_ALERT_S = int(os.getenv("LATENCY_ALERT_S", "300"))
+# Fleet topology + shared internal secret for master↔slave /spawn:
 SLAVE_URLS: list[str] = [u.strip().rstrip("/") for u in os.getenv("SLAVE_URLS", "").split(",") if u.strip()]
-# Capacity poll timeout (seconds) when picking a worker.
-WORKER_CAPACITY_TIMEOUT_S = float(os.getenv("WORKER_CAPACITY_TIMEOUT_S", "2.0"))
-# Shared secret for master ↔ slave /spawn calls. Required when SLAVE_URLS is set
-# or when this node may receive /spawn (i.e. always, defensively).
 INTERNAL_SECRET = os.getenv("INTERNAL_SECRET", "")
 
-# ---- Runner watchdog knobs ----
-RUNNER_IDLE_TIMEOUT = int(os.getenv("RUNNER_IDLE_TIMEOUT", "600"))
-RUNNER_JOB_TIMEOUT = int(os.getenv("RUNNER_JOB_TIMEOUT", "7200"))
-RUNNER_POLL_INTERVAL = int(os.getenv("RUNNER_POLL_INTERVAL", "15"))
-
-# SLA: alert if a workflow_job sits in "queued" state longer than this before any
-# runner in the org pool picks it up. Measured by the gap between the
-# workflow_job.queued and workflow_job.in_progress webhooks for the SAME job_id —
-# NOT by what our particular container did. Org-scoped runners mean another
-# runner in the pool may legitimately pick up a job we spawned for, and that's
-# fine for the end user. What matters is "did the user's commit get its CI in
-# reasonable time?"
-LATENCY_ALERT_S = int(os.getenv("LATENCY_ALERT_S", "300"))
-LATENCY_SWEEP_INTERVAL_S = int(os.getenv("LATENCY_SWEEP_INTERVAL_S", "30"))
-# Drop tracking entries older than this so memory doesn't grow unbounded.
-LATENCY_TRACK_TTL_S = int(os.getenv("LATENCY_TRACK_TTL_S", "3600"))
-
-# Queue poller (master only). The build server is purely event-driven by GitHub
-# webhooks: 1 webhook → 1 spawn. If a webhook is lost OR our spawned runner is
-# assigned a different job by the org pool, the original job sits in GitHub's
-# queue forever — we'll never get a second chance to know about it. The poller
-# periodically scans GitHub's queued jobs for each ALLOWED_ORG and synthesises
-# a spawn for anything that's been queued > QUEUE_POLL_AGE_THRESHOLD_S and isn't
-# already tracked. Self-correcting; eventually drains any backlog.
-QUEUE_POLL_INTERVAL_S = int(os.getenv("QUEUE_POLL_INTERVAL_S", "60"))
-QUEUE_POLL_AGE_THRESHOLD_S = int(os.getenv("QUEUE_POLL_AGE_THRESHOLD_S", "60"))
-QUEUE_POLL_ENABLED = os.getenv("QUEUE_POLL_ENABLED", "1") not in ("0", "false", "False", "")
+# ---------- Internal constants (no env) ----------
+# Promoted from env to constants — nobody had a realistic per-deployment reason
+# to tune these. If a real reason ever appears, promote back to env.
+SPAWN_COOLDOWN_S = 15              # throttle in the tight band (avail < 2 × MIN_FREE_RAM_MB)
+PENDING_JOB_DEADLINE_S = 3600      # drop locally-queued jobs older than 1h
+PENDING_DRAIN_INTERVAL_S = 5       # drainer tick
+WORKER_CAPACITY_TIMEOUT_S = 5.0    # HTTP timeout when polling worker /capacity
+RUNNER_IDLE_TIMEOUT = 600          # kill runner that hasn't picked up a job in 10 min
+RUNNER_POLL_INTERVAL = 15          # spawn_runner watchdog tick
+LATENCY_SWEEP_INTERVAL_S = 30      # SLA sweeper tick
+LATENCY_TRACK_TTL_S = 3600         # drop SLA tracking entries older than 1h
+QUEUE_POLL_INTERVAL_S = 60         # scan GitHub for orphan queued jobs every minute
+QUEUE_POLL_AGE_THRESHOLD_S = 60    # skip jobs younger than this (race with real webhook)
+QUEUE_POLL_ENABLED = True          # ops kill switch — set False here if poller misbehaves
 
 DEFAULT_IMAGE = os.environ["DEFAULT_RUNNER_IMAGE"]
 ALLOWED_ORGS: set[str] = set(filter(None, os.getenv("ALLOWED_ORGS", "").split(",")))
@@ -103,13 +84,10 @@ _active_runners: int = 0
 COLD_START_WINDOW_S = 60
 _recent_spawns: deque[float] = deque()
 
-# Cap concurrent docker.containers.run() calls. dockerd serializes API requests
-# at the unix socket; calling 80 spawns at once produces 60s ReadTimeouts and
-# silently-lost jobs. Defaults to vCPU count — a reasonable rate that keeps
-# dockerd responsive without throttling burst capacity in the common case.
-MAX_CONCURRENT_DOCKER_SPAWNS = int(
-    os.getenv("MAX_CONCURRENT_DOCKER_SPAWNS") or (os.cpu_count() or 4)
-)
+# Cap concurrent docker.containers.run() calls at vCPU count. dockerd serializes
+# API requests at the unix socket; calling 80 spawns at once produces 60s
+# ReadTimeouts and silently-lost jobs.
+MAX_CONCURRENT_DOCKER_SPAWNS = os.cpu_count() or 4
 _docker_spawn_sem = asyncio.Semaphore(MAX_CONCURRENT_DOCKER_SPAWNS)
 
 # ---- FIFO of jobs awaiting capacity. Used on every node (drainer below) ----
@@ -124,14 +102,12 @@ _job_lock = asyncio.Lock()
 IS_MASTER = bool(SLAVE_URLS) or gi is not None
 
 log.info(
-    "Build server starting: role=%s slaves=%d MIN_FREE_RAM=%dMB WORST_CASE_RUNNER=%dMB "
-    "COOLDOWN=%ds DOCKER_SEM=%d IDLE_TIMEOUT=%ds JOB_TIMEOUT=%ds SLA_ALERT=%ds QUEUE_POLL=%s "
-    "DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
+    "Build server starting: role=%s slaves=%d MIN_FREE_RAM=%dMB BURST_AT=%dMB "
+    "DOCKER_SEM=%d JOB_TIMEOUT=%ds SLA_ALERT=%ds DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
     "master" if IS_MASTER else "slave",
-    len(SLAVE_URLS), MIN_FREE_RAM_MB, WORST_CASE_RUNNER_MB, SPAWN_COOLDOWN_S,
+    len(SLAVE_URLS), MIN_FREE_RAM_MB, 2 * MIN_FREE_RAM_MB,
     MAX_CONCURRENT_DOCKER_SPAWNS,
-    RUNNER_IDLE_TIMEOUT, RUNNER_JOB_TIMEOUT, LATENCY_ALERT_S,
-    f"{QUEUE_POLL_INTERVAL_S}s" if QUEUE_POLL_ENABLED else "off",
+    RUNNER_JOB_TIMEOUT, LATENCY_ALERT_S,
     DEFAULT_IMAGE, ALLOWED_ORGS or "unrestricted",
 )
 
@@ -186,7 +162,9 @@ def _can_spawn_local(now: float) -> tuple[bool, str, int]:
             f"inflight={inflight_mb}MB ({len(_recent_spawns)} spawns) min={MIN_FREE_RAM_MB}MB"
         ), raw_avail
     headroom = effective_avail - MIN_FREE_RAM_MB
-    if headroom >= WORST_CASE_RUNNER_MB:
+    # Burst when there's room for another reserve-worth of allocation
+    # (i.e. effective_avail >= 2 × MIN_FREE_RAM_MB).
+    if headroom >= MIN_FREE_RAM_MB:
         return True, (
             f"burst effective={effective_avail}MB inflight={inflight_mb}MB headroom={headroom}MB"
         ), raw_avail
@@ -206,7 +184,7 @@ def _local_capacity_snapshot() -> dict:
         "active": _active_runners,
         "mem_available_mb": avail,
         "mem_min_free_mb": MIN_FREE_RAM_MB,
-        "worst_case_runner_mb": WORST_CASE_RUNNER_MB,
+        "mem_burst_at_mb": 2 * MIN_FREE_RAM_MB,
         "inflight_spawns": inflight_count,
         "inflight_reserved_mb": inflight_count * MIN_FREE_RAM_MB,
         "can_spawn": ok,
