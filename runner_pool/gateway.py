@@ -10,7 +10,8 @@ import hashlib
 import hmac
 import os
 
-import requests as _requests
+import httpx
+import requests as _requests   # only used in the queue poller (blocking is fine there)
 from fastapi import FastAPI, HTTPException, Request
 
 from ._common import (
@@ -27,6 +28,7 @@ LATENCY_ALERT_S = int(os.getenv("LATENCY_ALERT_S", "300"))
 
 # ---------- Internal constants ----------
 WORKER_CAPACITY_TIMEOUT_S = 5.0
+WORKER_DISPATCH_TIMEOUT_S = 30.0   # POST /spawn — runner side can be slow if dockerd is saturated
 WORKER_UNREACHABLE_THRESHOLD = 3
 PENDING_JOB_DEADLINE_S = 3600
 PENDING_DRAIN_INTERVAL_S = 5
@@ -34,6 +36,11 @@ LATENCY_SWEEP_INTERVAL_S = 30
 LATENCY_TRACK_TTL_S = 3600
 QUEUE_POLL_INTERVAL_S = 60
 QUEUE_POLL_AGE_THRESHOLD_S = 60
+
+# Shared async HTTP client. Using httpx avoids the default ThreadPoolExecutor
+# saturating at ~28 threads under burst (which previously turned 100 concurrent
+# /spawn POSTs into a 30s+ serial pipeline of ReadTimeouts).
+_http: httpx.AsyncClient | None = None
 
 # ---------- State ----------
 _pending: list[dict] = []
@@ -135,14 +142,11 @@ def _verify_github_signature(body: bytes, header: str) -> None:
 # ---------- Routing ----------
 
 async def _worker_capacity(url: str) -> dict | None:
-    loop = asyncio.get_event_loop()
     data: dict | None = None
+    assert _http is not None, "httpx client not initialized"
     try:
-        resp = await loop.run_in_executor(
-            None,
-            lambda: _requests.get(f"{url}/capacity", timeout=WORKER_CAPACITY_TIMEOUT_S),
-        )
-        if resp.ok:
+        resp = await _http.get(f"{url}/capacity", timeout=WORKER_CAPACITY_TIMEOUT_S)
+        if resp.is_success:
             data = resp.json()
             data["url"] = url
     except Exception:
@@ -193,16 +197,13 @@ async def _pick_worker_order() -> list[str]:
 
 
 async def _dispatch(worker_url: str, job: dict) -> bool:
-    loop = asyncio.get_event_loop()
+    assert _http is not None, "httpx client not initialized"
     try:
-        resp = await loop.run_in_executor(
-            None,
-            lambda: _requests.post(
-                f"{worker_url}/spawn",
-                json=job,
-                headers={"X-Internal-Secret": INTERNAL_SECRET},
-                timeout=10,
-            ),
+        resp = await _http.post(
+            f"{worker_url}/spawn",
+            json=job,
+            headers={"X-Internal-Secret": INTERNAL_SECRET},
+            timeout=WORKER_DISPATCH_TIMEOUT_S,
         )
         if resp.status_code == 200:
             log.info("Dispatched: org=%s job_id=%s → %s", job["org"], job["job_id"], worker_url)
@@ -453,7 +454,20 @@ async def _poll_queued_orphans() -> None:
 
 @app.on_event("startup")
 async def _start_background_tasks():
+    global _http
+    # Big connection pool so burst dispatches don't queue at TCP setup; a
+    # generous per-request timeout (we override per-call too) is just a backstop.
+    _http = httpx.AsyncClient(
+        timeout=WORKER_DISPATCH_TIMEOUT_S,
+        limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
+    )
     asyncio.create_task(_drain_pending())
     asyncio.create_task(_latency_sweeper())
     if gi is not None and ALLOWED_ORGS:
         asyncio.create_task(_queue_poller())
+
+
+@app.on_event("shutdown")
+async def _close_http():
+    if _http is not None:
+        await _http.aclose()

@@ -44,6 +44,15 @@ _active_runners: int = 0
 _recent_spawns: deque[float] = deque()
 _pending: list[dict] = []   # failed-spawn retry queue
 _docker_spawn_sem = asyncio.Semaphore(MAX_CONCURRENT_DOCKER_SPAWNS)
+# Dedup committed (org, job_id) for SPAWN_DEDUP_TTL_S seconds. If the gateway
+# times out waiting for our 200 response, it'll retry and dispatch the same job
+# again — without dedup we'd spawn a second container for it.
+# Keep TTL SHORT: under org-pool semantics a spawn for X may legitimately end up
+# serving Y, leaving X queued. The queue poller (60s) needs to be able to
+# re-spawn for X. 30s is enough to absorb timeout-retries (which happen within
+# seconds of the original) without blocking the poller's next pass.
+SPAWN_DEDUP_TTL_S = 30
+_recent_committed: dict[tuple[str, int], float] = {}
 
 app = FastAPI()
 
@@ -103,12 +112,25 @@ async def spawn(request: Request, x_internal_secret: str = Header(default="")):
     if not hmac.compare_digest(x_internal_secret, INTERNAL_SECRET):
         raise HTTPException(status_code=401, detail="bad internal secret")
     job = await request.json()
+    key = (job["org"], int(job["job_id"]))
     async with _state_lock:
-        ok, reason, _ = _can_spawn(asyncio.get_event_loop().time())
+        now = asyncio.get_event_loop().time()
+        # Dedup: gateway may retry if it timed out waiting for our 200 response.
+        for k in list(_recent_committed.keys()):
+            if now - _recent_committed[k] > SPAWN_DEDUP_TTL_S:
+                del _recent_committed[k]
+        if key in _recent_committed:
+            log.info(
+                "Spawn dedup: org=%s job_id=%s already committed %.0fs ago — replying ok",
+                key[0], key[1], now - _recent_committed[key],
+            )
+            return {"ok": True, "deduplicated": True}
+        ok, reason, _ = _can_spawn(now)
         if not ok:
-            log.info("Spawn rejected: org=%s job_id=%s (%s)", job.get("org"), job.get("job_id"), reason)
+            log.info("Spawn rejected: org=%s job_id=%s (%s)", key[0], key[1], reason)
             raise HTTPException(status_code=503, detail=reason)
         _commit_spawn(job, reason)
+        _recent_committed[key] = now
     return {"ok": True}
 
 
