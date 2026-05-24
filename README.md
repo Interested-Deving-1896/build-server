@@ -22,27 +22,25 @@ GitHub ──webhook──► MASTER ──┬── spawn locally (if it has th
 
 Concurrency on each node is gated by free RAM (`/proc/meminfo MemAvailable`), not a fixed runner count.
 
-| Knob | Default | Meaning |
-|---|---|---|
-| `MIN_FREE_RAM_MB` | 3072 | Always keep this much free. Below = refuse. |
-| `WORST_CASE_RUNNER_MB` | 3072 | Assumed peak per runner (single tunable, no per-image table). |
-| `SPAWN_COOLDOWN_S` | 15 | Only applies when headroom < worst-case. Lets MemAvailable catch up. |
+Single knob: `MIN_FREE_RAM_MB` (default 3072) — how much RAM to always keep free for OS + spike headroom.
 
 ```python
-avail = mem_available_mb()
-if avail < MIN_FREE_RAM_MB:                 return False  # refuse
-headroom = avail - MIN_FREE_RAM_MB
-if headroom >= WORST_CASE_RUNNER_MB:        return True   # burst
-if (now - last_spawn_at) < SPAWN_COOLDOWN_S: return False  # throttle
-return True                                                # tight ok
+avail = mem_available_mb() - inflight_reservation  # see below
+if avail < MIN_FREE_RAM_MB:                      return False   # refuse
+if avail >= 2 * MIN_FREE_RAM_MB:                 return True    # burst
+if (now - last_spawn_at) < SPAWN_COOLDOWN_S(15s): return False  # throttle
+return True                                                     # tight ok
 ```
 
-| MemAvailable | headroom | behavior |
-|---|---|---|
-| 12 GB | 9 GB | burst (3 heavy runners in parallel) |
-| 6 GB | 3 GB | one more burst |
-| 5 GB | 2 GB | 1 spawn / 15s |
-| < 3 GB | — | refuse → next worker / queue |
+| MemAvailable | behavior (default MIN=3072) |
+|---|---|
+| < 3 GB | refuse → next worker / queue |
+| 3–6 GB | tight, 1 spawn / 15s |
+| ≥ 6 GB | burst freely |
+
+In-flight reservation: each recent spawn (within last 60s) "owes" `MIN_FREE_RAM_MB` worth of allocation in the accounting. Prevents a webhook stampede from racing past the RAM gate while containers haven't yet started consuming memory.
+
+Burst is also capped by a docker-daemon semaphore (= vCPU count) so `containers.run()` calls don't pile up at the unix socket.
 
 ## Runner image per job
 
@@ -102,6 +100,6 @@ No changes needed in GitHub, no changes on existing slaves.
 
 Defaults are conservative for a 12 GB host with a mix of linux/android jobs.
 
-- **Lots of small linux jobs only?** Drop `MIN_FREE_RAM_MB` and `WORST_CASE_RUNNER_MB` to 1024 each → higher density, faster ramp-up.
-- **Mostly android/e2e?** Defaults are fine. If you OOM, raise `WORST_CASE_RUNNER_MB` to your observed peak; the cooldown will kick in earlier.
+- **Lots of small linux jobs only?** Drop `MIN_FREE_RAM_MB` to ~1024 → higher density.
+- **Mostly android/e2e?** Raise to your largest-job peak (e.g. 4096). Tight band widens, throttling kicks in earlier.
 - **Host has lots of swap?** Don't lean on it — swap protects from OOM-kill but not from thrash. Treat swap as a safety net, keep `MIN_FREE_RAM_MB` realistic.
