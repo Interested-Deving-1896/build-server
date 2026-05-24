@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
-# Idempotent VPS provisioner for the build server.
-# Run as root on the target VPS.
+# Idempotent VPS provisioner. Run as root on the target host.
+#
+# Two systemd services are installed; you choose which to enable per host:
+#
+#   build-server-gateway.service  — receives GitHub webhooks, dispatches to
+#                                   runners. Listens on 127.0.0.1:3000 (nginx
+#                                   reverse-proxies :80 → :3000). Set WORKERS
+#                                   in .env to a comma-separated list of
+#                                   runner URLs (e.g. http://127.0.0.1:3001
+#                                   for a self-contained single-host deploy).
+#
+#   build-server-runner.service   — accepts /spawn from a gateway, spawns
+#                                   ephemeral github-runner containers.
+#                                   Listens on 127.0.0.1:3001.
+#
+# Single-host deploy: enable both. Multi-host: gateway on one box, runner on
+# each of N worker boxes.
 set -euo pipefail
 
 INSTALL_DIR=/opt/build-server
@@ -22,12 +37,14 @@ python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install --quiet -r "$INSTALL_DIR/runner_pool/requirements.txt"
 
-echo "=== Installing systemd service ==="
-cp "$INSTALL_DIR/systemd/build-server.service" /etc/systemd/system/build-server.service
+echo "=== Installing systemd units ==="
+cp "$INSTALL_DIR/systemd/build-server-gateway.service" /etc/systemd/system/
+cp "$INSTALL_DIR/systemd/build-server-runner.service"  /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable build-server
+# Enable both by default — disable whichever you don't want for this host.
+systemctl enable build-server-gateway build-server-runner
 
-echo "=== Configuring nginx reverse proxy ==="
+echo "=== Configuring nginx reverse proxy (→ gateway on :3000) ==="
 cat > /etc/nginx/sites-available/build-server << 'EOF'
 server {
     listen 80;
@@ -46,9 +63,11 @@ ln -sf /etc/nginx/sites-available/build-server /etc/nginx/sites-enabled/build-se
 rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl enable --now nginx && systemctl reload nginx
 
-echo ""
+echo
 echo "=== Done ==="
-echo "Next: copy .env.example to /opt/build-server/.env and fill in credentials,"
-echo "then: systemctl start build-server && systemctl status build-server"
-echo ""
+echo "Next:"
+echo "  1. cp $INSTALL_DIR/.env.example $INSTALL_DIR/.env and fill in credentials."
+echo "  2. systemctl start build-server-runner build-server-gateway"
+echo "  3. (single-host) ensure .env has WORKERS=http://127.0.0.1:3001"
+echo
 echo "Webhook URL: http://$(curl -s ifconfig.me)/webhook"
