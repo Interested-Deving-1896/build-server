@@ -52,10 +52,18 @@ INTERNAL_SECRET = os.getenv("INTERNAL_SECRET", "")
 RUNNER_IDLE_TIMEOUT = int(os.getenv("RUNNER_IDLE_TIMEOUT", "600"))
 RUNNER_JOB_TIMEOUT = int(os.getenv("RUNNER_JOB_TIMEOUT", "7200"))
 RUNNER_POLL_INTERVAL = int(os.getenv("RUNNER_POLL_INTERVAL", "15"))
-# Alert if a runner sits idle this long without picking up a job.
-# Anchored on docker run time intentionally — this is the user-facing
-# "commit → job started" SLA, not an internal cold-start metric.
-RUNNER_IDLE_ALERT_SECS = int(os.getenv("RUNNER_IDLE_ALERT_SECS", "300"))
+
+# SLA: alert if a workflow_job sits in "queued" state longer than this before any
+# runner in the org pool picks it up. Measured by the gap between the
+# workflow_job.queued and workflow_job.in_progress webhooks for the SAME job_id —
+# NOT by what our particular container did. Org-scoped runners mean another
+# runner in the pool may legitimately pick up a job we spawned for, and that's
+# fine for the end user. What matters is "did the user's commit get its CI in
+# reasonable time?"
+LATENCY_ALERT_S = int(os.getenv("LATENCY_ALERT_S", "300"))
+LATENCY_SWEEP_INTERVAL_S = int(os.getenv("LATENCY_SWEEP_INTERVAL_S", "30"))
+# Drop tracking entries older than this so memory doesn't grow unbounded.
+LATENCY_TRACK_TTL_S = int(os.getenv("LATENCY_TRACK_TTL_S", "3600"))
 
 DEFAULT_IMAGE = os.environ["DEFAULT_RUNNER_IMAGE"]
 ALLOWED_ORGS: set[str] = set(filter(None, os.getenv("ALLOWED_ORGS", "").split(",")))
@@ -78,15 +86,21 @@ _active_runners: int = 0
 
 # ---- Master state (unused on slaves) ----
 _pending: list[dict] = []  # FIFO of jobs awaiting capacity across the fleet
+# SLA tracking: (org, job_id) -> monotonic_time when workflow_job.queued arrived.
+# Cleared on workflow_job.in_progress (success: latency computed) or .completed.
+# Sweeper alerts on entries older than LATENCY_ALERT_S.
+_job_queued_at: dict[tuple[str, int], float] = {}
+_job_alerted: set[tuple[str, int]] = set()
+_job_lock = asyncio.Lock()
 
 IS_MASTER = bool(SLAVE_URLS) or gi is not None
 
 log.info(
     "Build server starting: role=%s slaves=%d MIN_FREE_RAM=%dMB WORST_CASE_RUNNER=%dMB "
-    "COOLDOWN=%ds IDLE_TIMEOUT=%ds JOB_TIMEOUT=%ds DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
+    "COOLDOWN=%ds IDLE_TIMEOUT=%ds JOB_TIMEOUT=%ds SLA_ALERT=%ds DEFAULT_IMAGE=%s ALLOWED_ORGS=%s",
     "master" if IS_MASTER else "slave",
     len(SLAVE_URLS), MIN_FREE_RAM_MB, WORST_CASE_RUNNER_MB, SPAWN_COOLDOWN_S,
-    RUNNER_IDLE_TIMEOUT, RUNNER_JOB_TIMEOUT, DEFAULT_IMAGE,
+    RUNNER_IDLE_TIMEOUT, RUNNER_JOB_TIMEOUT, LATENCY_ALERT_S, DEFAULT_IMAGE,
     ALLOWED_ORGS or "unrestricted",
 )
 
@@ -170,7 +184,7 @@ async def webhook(request: Request):
 
     payload = await request.json()
     action = payload.get("action")
-    if action != "queued" or "workflow_job" not in payload:
+    if "workflow_job" not in payload:
         return {"ok": True}
 
     installation_id = (payload.get("installation") or {}).get("id")
@@ -179,6 +193,14 @@ async def webhook(request: Request):
     repo_full_name = payload["repository"]["full_name"]
     labels: list[str] = payload["workflow_job"].get("labels", [])
     job_id = payload["workflow_job"]["id"]
+
+    # Track latency across queued -> in_progress regardless of org allowlist
+    # (the metric reflects platform health, not whether we'd spawn).
+    if all(lbl not in _NON_LINUX_OS for lbl in labels) and not all(lbl in _GITHUB_HOSTED for lbl in labels):
+        await _track_job_event(org, job_id, action)
+
+    if action != "queued":
+        return {"ok": True}
 
     if ALLOWED_ORGS and org not in ALLOWED_ORGS:
         log.warning("Ignored job from unlisted org=%s job_id=%d", org, job_id)
@@ -387,9 +409,76 @@ async def _drain_once() -> None:
 
 
 @app.on_event("startup")
-async def _start_drainer():
+async def _start_background_tasks():
     if IS_MASTER:
         asyncio.create_task(_drain_pending())
+        asyncio.create_task(_latency_sweeper())
+
+
+# ---------- SLA latency tracking ----------
+
+async def _track_job_event(org: str, job_id: int, action: str) -> None:
+    """Record/clear (org, job_id) timestamps from workflow_job webhooks so the
+    sweeper can alert on queue→start latency above LATENCY_ALERT_S."""
+    key = (org, job_id)
+    now = asyncio.get_event_loop().time()
+    async with _job_lock:
+        if action == "queued":
+            # First queued event wins (dedupe duplicate deliveries).
+            _job_queued_at.setdefault(key, now)
+        elif action == "in_progress":
+            queued_at = _job_queued_at.pop(key, None)
+            already_alerted = key in _job_alerted
+            _job_alerted.discard(key)
+            if queued_at is None:
+                return
+            latency = now - queued_at
+            log.info(
+                "SLA: org=%s job_id=%s queue_latency=%.1fs",
+                org, job_id, latency,
+            )
+            if latency > LATENCY_ALERT_S and not already_alerted:
+                msg = (
+                    f"⚠️ <b>Build server SLA</b>\n"
+                    f"Job <code>{org}/{job_id}</code> waited "
+                    f"<b>{int(latency)}s</b> queued before a runner picked it up."
+                )
+                asyncio.create_task(asyncio.to_thread(_tg_notify, msg))
+        elif action == "completed":
+            _job_queued_at.pop(key, None)
+            _job_alerted.discard(key)
+
+
+async def _latency_sweeper() -> None:
+    """Periodically check tracked jobs. Alert (once) on entries that have been
+    queued > LATENCY_ALERT_S without an in_progress event. Expire entries past
+    LATENCY_TRACK_TTL_S so the map can't grow unbounded."""
+    while True:
+        await asyncio.sleep(LATENCY_SWEEP_INTERVAL_S)
+        try:
+            now = asyncio.get_event_loop().time()
+            to_alert: list[tuple[str, int, float]] = []
+            async with _job_lock:
+                for key in list(_job_queued_at.keys()):
+                    age = now - _job_queued_at[key]
+                    if age > LATENCY_TRACK_TTL_S:
+                        del _job_queued_at[key]
+                        _job_alerted.discard(key)
+                        continue
+                    if age > LATENCY_ALERT_S and key not in _job_alerted:
+                        _job_alerted.add(key)
+                        org, job_id = key
+                        to_alert.append((org, job_id, age))
+            for org, job_id, age in to_alert:
+                msg = (
+                    f"⚠️ <b>Build server SLA</b>\n"
+                    f"Job <code>{org}/{job_id}</code> still queued after "
+                    f"<b>{int(age)}s</b> — no runner has picked it up yet."
+                )
+                log.warning("SLA breach: org=%s job_id=%s age=%.0fs", org, job_id, age)
+                asyncio.create_task(asyncio.to_thread(_tg_notify, msg))
+        except Exception:
+            log.exception("latency sweeper failed")
 
 
 # ---------- GitHub helpers ----------
@@ -494,7 +583,6 @@ async def spawn_runner(job: dict) -> None:
 
         start = asyncio.get_event_loop().time()
         job_started_at: float | None = None
-        idle_alerted = False
         while True:
             await asyncio.sleep(RUNNER_POLL_INTERVAL)
             try:
@@ -521,26 +609,18 @@ async def spawn_runner(job: dict) -> None:
                     logs = ""
                 if "Running job:" in logs:
                     job_started_at = now
-                    log.info("Runner picked up job: org=%s job_id=%s", org, job_id)
-                else:
-                    if not idle_alerted and elapsed >= RUNNER_IDLE_ALERT_SECS:
-                        idle_alerted = True
-                        msg = (
-                            f"⚠️ <b>Build server alert</b>\n"
-                            f"Runner for <code>{org}</code> job <code>{job_id}</code> "
-                            f"has been idle {int(elapsed)}s without picking up a job.\n"
-                            f"Labels: <code>{', '.join(labels)}</code>\n"
-                            f"Image: <code>{image}</code>"
-                        )
-                        log.warning("Sending idle alert: org=%s job_id=%s elapsed=%ds", org, job_id, int(elapsed))
-                        await loop.run_in_executor(None, lambda: _tg_notify(msg))
-                    if elapsed > RUNNER_IDLE_TIMEOUT:
-                        log.warning(
-                            "Runner idle %ds without a job: org=%s job_id=%s — killing",
-                            RUNNER_IDLE_TIMEOUT, org, job_id,
-                        )
-                        await loop.run_in_executor(None, container.kill)
-                        break
+                    log.info("Runner picked up job: org=%s spawned_for=%s", org, job_id)
+                elif elapsed > RUNNER_IDLE_TIMEOUT:
+                    # Wasted spawn — org pool gave this job (or others queued in
+                    # the same burst) to a different runner before this one
+                    # registered. No alert: see SLA tracker for user-facing
+                    # latency. Just reclaim the container.
+                    log.info(
+                        "Runner idle %ds without a job: org=%s spawned_for=%s — killing (likely lost org-pool race)",
+                        RUNNER_IDLE_TIMEOUT, org, job_id,
+                    )
+                    await loop.run_in_executor(None, container.kill)
+                    break
             elif now - job_started_at > RUNNER_JOB_TIMEOUT:
                 log.warning(
                     "Job exceeded %ds: org=%s job_id=%s — killing",
