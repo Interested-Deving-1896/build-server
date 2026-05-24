@@ -4,6 +4,7 @@ import hmac
 import logging
 import os
 import time
+from collections import deque
 
 import docker
 import jwt as _jwt
@@ -94,6 +95,13 @@ _NON_LINUX_OS = {"Windows", "macOS"}
 _state_lock = asyncio.Lock()
 _last_spawn_at: float = 0.0
 _active_runners: int = 0
+# Pessimistic in-flight RAM accounting: each recent spawn is assumed to "owe"
+# MIN_FREE_RAM_MB worth of allocation until COLD_START_WINDOW_S has elapsed
+# (long enough for the container + github-runner agent + actual job process to
+# materialise in MemAvailable). Prevents a webhook stampede from racing past
+# the RAM gate when 100 runners haven't yet started consuming memory.
+COLD_START_WINDOW_S = 60
+_recent_spawns: deque[float] = deque()
 
 # Cap concurrent docker.containers.run() calls. dockerd serializes API requests
 # at the unix socket; calling 80 spawns at once produces 60s ReadTimeouts and
@@ -159,28 +167,48 @@ def _can_spawn_local(now: float) -> tuple[bool, str, int]:
     """Decide whether THIS host can absorb one more runner right now.
 
     Returns (ok, reason, mem_available_mb). Caller MUST hold _state_lock
-    when committing on the basis of this call (it reads _last_spawn_at).
+    when committing on the basis of this call (it reads _last_spawn_at,
+    _recent_spawns).
     """
-    avail = _mem_available_mb()
-    if avail < MIN_FREE_RAM_MB:
-        return False, f"ram_low avail={avail}MB min={MIN_FREE_RAM_MB}MB", avail
-    headroom = avail - MIN_FREE_RAM_MB
+    # Decay in-flight reservations: spawns older than COLD_START_WINDOW_S have
+    # had time to allocate their share into MemAvailable, so trust the kernel
+    # number from here on.
+    while _recent_spawns and now - _recent_spawns[0] > COLD_START_WINDOW_S:
+        _recent_spawns.popleft()
+
+    raw_avail = _mem_available_mb()
+    inflight_mb = len(_recent_spawns) * MIN_FREE_RAM_MB
+    effective_avail = raw_avail - inflight_mb
+
+    if effective_avail < MIN_FREE_RAM_MB:
+        return False, (
+            f"ram_low effective={effective_avail}MB raw={raw_avail}MB "
+            f"inflight={inflight_mb}MB ({len(_recent_spawns)} spawns) min={MIN_FREE_RAM_MB}MB"
+        ), raw_avail
+    headroom = effective_avail - MIN_FREE_RAM_MB
     if headroom >= WORST_CASE_RUNNER_MB:
-        return True, f"burst headroom={headroom}MB", avail
+        return True, (
+            f"burst effective={effective_avail}MB inflight={inflight_mb}MB headroom={headroom}MB"
+        ), raw_avail
     wait = SPAWN_COOLDOWN_S - (now - _last_spawn_at)
     if wait > 0:
-        return False, f"cooldown {wait:.0f}s left headroom={headroom}MB", avail
-    return True, f"tight headroom={headroom}MB", avail
+        return False, (
+            f"cooldown {wait:.0f}s left effective={effective_avail}MB headroom={headroom}MB"
+        ), raw_avail
+    return True, f"tight effective={effective_avail}MB headroom={headroom}MB", raw_avail
 
 
 def _local_capacity_snapshot() -> dict:
     now = asyncio.get_event_loop().time()
     ok, reason, avail = _can_spawn_local(now)
+    inflight_count = len(_recent_spawns)
     return {
         "active": _active_runners,
         "mem_available_mb": avail,
         "mem_min_free_mb": MIN_FREE_RAM_MB,
         "worst_case_runner_mb": WORST_CASE_RUNNER_MB,
+        "inflight_spawns": inflight_count,
+        "inflight_reserved_mb": inflight_count * MIN_FREE_RAM_MB,
         "can_spawn": ok,
         "status": reason,
     }
@@ -284,11 +312,13 @@ async def spawn_endpoint(request: Request, x_internal_secret: str = Header(defau
 def _commit_spawn(job: dict, reason: str) -> None:
     """Caller MUST hold _state_lock. Schedules spawn_runner as a background task."""
     global _last_spawn_at, _active_runners
-    _last_spawn_at = asyncio.get_event_loop().time()
+    now = asyncio.get_event_loop().time()
+    _last_spawn_at = now
     _active_runners += 1
+    _recent_spawns.append(now)  # ages out of COLD_START_WINDOW_S automatically in _can_spawn_local
     log.info(
-        "Spawning runner locally: org=%s job_id=%s active=%d (%s)",
-        job["org"], job["job_id"], _active_runners, reason,
+        "Spawning runner locally: org=%s job_id=%s active=%d inflight=%d (%s)",
+        job["org"], job["job_id"], _active_runners, len(_recent_spawns), reason,
     )
     asyncio.create_task(spawn_runner(job))
 
