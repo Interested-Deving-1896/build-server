@@ -49,6 +49,21 @@ RUN ARCH="$(dpkg --print-architecture)"; \
  && /tmp/aws/install \
  && rm -rf /tmp/aws /tmp/awscliv2.zip
 
+# Python 3.12 (noble system python3), Node 22 (nodesource) and uv: preinstalled
+# so Miraj-OS workflows can drop setup-python/setup-node/setup-uv entirely
+# (~40s of per-job downloads on the ARC box; tool-cache lives on tmpfs _work,
+# so setup-* actions re-download on every JIT pod).
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      python3 python3-venv python3-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /uvx /usr/local/bin/
+
 # In CI we trust every repo we operate on. Disable git's "dubious ownership"
 # safety check (introduced in 2.35 by CVE-2022-24765). Without this, any step
 # that touches /opt/hostedtoolcache/... after a sudo apt install (which
