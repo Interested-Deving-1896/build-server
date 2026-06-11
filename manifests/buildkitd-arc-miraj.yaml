@@ -1,0 +1,80 @@
+# Persistent shared BuildKit daemon for Miraj-OS CI (chats build.yml, driver: remote).
+#
+# Why: ephemeral docker-container builders cost ~25s bootstrap per job and depend on
+# ghcr registry cache import/export, which flakes from this box (TLS handshake
+# timeouts to pkg-containers.githubusercontent.com → silent full rebuilds).
+# A long-lived buildkitd keeps the layer cache local on the node: no bootstrap,
+# no cache import/export, warm builds in seconds.
+#
+# Endpoint for workflows: tcp://buildkitd.arc-miraj.svc.cluster.local:1234
+# Cache: hostPath /opt/buildkit-cache, GC keeps it under ~25GB.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: buildkitd-config
+  namespace: arc-miraj
+data:
+  buildkitd.toml: |
+    [registry."docker.io"]
+      mirrors = ["mirror.gcr.io"]
+    [worker.oci]
+      enabled = true
+      gc = true
+      gckeepstorage = 25000000000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkitd
+  namespace: arc-miraj
+  labels: { app: buildkitd }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # single cache dir — never two writers
+  selector:
+    matchLabels: { app: buildkitd }
+  template:
+    metadata:
+      labels: { app: buildkitd }
+    spec:
+      containers:
+        - name: buildkitd
+          image: mirror.gcr.io/moby/buildkit:v0.30.0
+          args:
+            - --addr
+            - tcp://0.0.0.0:1234
+            - --config
+            - /etc/buildkit/buildkitd.toml
+          securityContext:
+            privileged: true
+          ports:
+            - containerPort: 1234
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+          readinessProbe:
+            tcpSocket: { port: 1234 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: 1234 }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            - { name: cache, mountPath: /var/lib/buildkit }
+            - { name: config, mountPath: /etc/buildkit }
+      volumes:
+        - name: cache
+          hostPath: { path: /opt/buildkit-cache, type: DirectoryOrCreate }
+        - name: config
+          configMap: { name: buildkitd-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkitd
+  namespace: arc-miraj
+spec:
+  selector: { app: buildkitd }
+  ports:
+    - port: 1234
+      targetPort: 1234
