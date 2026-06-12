@@ -1,0 +1,187 @@
+# Pull-through registry cache for the ARC build-server (jakwuh/build-server 104.239.66.110).
+#
+# Why: every JIT runner pod gets a fresh dind sidecar → empty docker image cache →
+# `docker pull mirror.gcr.io/library/postgres:16` re-downloads on every test job
+# (measured 16-57s of `Start Postgres` step). Same for any other base image any
+# project's build uses. A local pull-through cache turns the first pull/job into
+# the only network-bound one; everything afterwards reads from /var/lib/registry-cache
+# on the node (tens of milliseconds).
+#
+# How: registry:2 in proxy mode → mirror.gcr.io (Google's Docker Hub mirror;
+# avoids docker.io anonymous-pull limits as the upstream-of-our-cache). Each
+# project's dind sidecar gets `--registry-mirror=http://10.43.x.y:5000` (the
+# cluster Service IP), so any `docker pull <docker-hub-image>` resolves via us.
+#
+# Pruning: registry:2 does NOT prune layers on its own (`storage.delete.enabled`
+# only enables the delete API). Weekly CronJob runs `registry garbage-collect`
+# which sweeps blobs no manifest references. ConfigMap also has a hardcoded
+# storage size cap via emptyDir not — hostPath grows; cap is operator-enforced.
+# Currently no manifest deletion API is wired up — first-pulled = pinned. If
+# image churn becomes a problem we add a CronJob that calls the delete API
+# against tags older than N days.
+#
+# Manifest committed in jakwuh/build-server@main `manifests/registry-cache.yaml`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: registry-cache
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: registry-config
+  namespace: registry-cache
+data:
+  config.yml: |
+    version: 0.1
+    log:
+      fields:
+        service: registry
+    storage:
+      filesystem:
+        rootdirectory: /var/lib/registry
+      delete:
+        enabled: true
+      cache:
+        blobdescriptor: inmemory
+      maintenance:
+        uploadpurging:
+          enabled: true
+          age: 168h
+          interval: 24h
+          dryrun: false
+    http:
+      addr: :5000
+      headers:
+        X-Content-Type-Options: [nosniff]
+    proxy:
+      remoteurl: https://mirror.gcr.io
+    health:
+      storagedriver:
+        enabled: true
+        interval: 10s
+        threshold: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: registry-cache
+  labels: { app: registry }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: registry }
+  template:
+    metadata:
+      labels: { app: registry }
+    spec:
+      containers:
+        - name: registry
+          image: mirror.gcr.io/library/registry:2
+          ports: [{ containerPort: 5000 }]
+          resources:
+            requests: { cpu: "100m", memory: 256Mi }
+          readinessProbe:
+            httpGet: { path: /v2/, port: 5000 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /v2/, port: 5000 }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            - { name: storage, mountPath: /var/lib/registry }
+            - { name: config, mountPath: /etc/docker/registry/config.yml, subPath: config.yml }
+      volumes:
+        - name: storage
+          hostPath: { path: /var/lib/registry-cache, type: DirectoryOrCreate }
+        - name: config
+          configMap: { name: registry-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: registry-cache
+spec:
+  selector: { app: registry }
+  ports:
+    - port: 5000
+      targetPort: 5000
+---
+# Weekly garbage-collect of unreferenced blobs. registry:2 garbage-collect must
+# run with the registry stopped (or in --dry-run), but with mode=Recreate the
+# safest mortgage-free approach is to scale down → GC → scale up.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: registry-gc
+  namespace: registry-cache
+spec:
+  schedule: "23 3 * * 0"   # Sundays 03:23 UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          serviceAccountName: registry-gc
+          restartPolicy: Never
+          containers:
+            - name: gc
+              image: mirror.gcr.io/library/bitnami/kubectl:latest
+              command: ["/bin/sh","-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  echo "scaling down registry"
+                  kubectl -n registry-cache scale deploy/registry --replicas=0
+                  kubectl -n registry-cache wait --for=delete pod -l app=registry --timeout=120s || true
+                  echo "running garbage-collect via one-shot pod"
+                  kubectl -n registry-cache run registry-gc-runner --rm -i --restart=Never \
+                    --image=mirror.gcr.io/library/registry:2 \
+                    --overrides='{"spec":{"containers":[{"name":"registry-gc-runner","image":"mirror.gcr.io/library/registry:2","command":["registry","garbage-collect","-m","/etc/docker/registry/config.yml"],"volumeMounts":[{"name":"storage","mountPath":"/var/lib/registry"},{"name":"config","mountPath":"/etc/docker/registry/config.yml","subPath":"config.yml"}]}],"volumes":[{"name":"storage","hostPath":{"path":"/var/lib/registry-cache","type":"Directory"}},{"name":"config","configMap":{"name":"registry-config"}}]}}'
+                  echo "scaling registry back up"
+                  kubectl -n registry-cache scale deploy/registry --replicas=1
+                  kubectl -n registry-cache rollout status deploy/registry --timeout=120s
+                  echo "done"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: registry-gc
+  namespace: registry-cache
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: registry-gc
+  namespace: registry-cache
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get","list","watch","create","delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get","list","patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get","patch","update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: registry-gc
+  namespace: registry-cache
+subjects:
+  - kind: ServiceAccount
+    name: registry-gc
+    namespace: registry-cache
+roleRef:
+  kind: Role
+  name: registry-gc
+  apiGroup: rbac.authorization.k8s.io
