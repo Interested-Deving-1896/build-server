@@ -1,70 +1,75 @@
+[update-readmes]   Mode: rewrite — migrating to template structure...
 # build-server
 
-Self-hosted GitHub Actions runner pool on a single host, powered by upstream [actions-runner-controller](https://github.com/actions/actions-runner-controller) (ARC) on k3s. ARC uses GitHub's **Just-in-Time runner configs** — each pod is bound to one specific job, so there is no shared org pool and no spawn race.
+[![Built with Ona](https://ona.com/build-with-ona.svg)](https://app.ona.com/#https://github.com/Interested-Deving-1896/build-server)
 
-This repo provides:
-- Deploy scaffolding (`setup.sh`, `scripts/deploy-scale-set.sh`).
-- A reference generic runner image at `ghcr.io/jakwuh/actions-runner:latest` (Dockerfile in `runner-image/`). It's an upstream `actions-runner` + the minimum CLI toolkit (`gh`, `aws`, `jq`, `git`, `curl`, `unzip`, `zip`, `xz`, `rsync`, `gnupg`) — everything else (Node, Java, Flutter, Playwright, Android SDK, Python …) is installed on demand by workflow steps via `setup-*` actions, cached through `actions/cache`. Use this for every scale-set unless you have a reason not to.
+<!-- AI:start:what-it-does -->
+_Description pending._
+<!-- AI:end:what-it-does -->
 
 ## Architecture
 
-```
-GitHub Actions broker ──long-poll──► ARC listener ─► ARC controller ─► k8s pod (JIT runner) ──► job
-```
+<!-- AI:start:architecture -->
+_Architecture documentation pending._
+<!-- AI:end:architecture -->
 
-One **scale-set** per `(GitHub org, runner image)` pair. The scale-set's name becomes the `runs-on:` label workflows use.
+## Install
 
-## Bootstrap a host
-
-```bash
-# Fresh host (24+ vCPU, 16+ GB RAM recommended for production load):
-ssh root@<HOST>
-bash <(curl -fsSL https://raw.githubusercontent.com/jakwuh/build-server/main/setup.sh)
-```
-
-`setup.sh` installs k3s + helm + the ARC controller into namespace `arc-systems`. Then deploy one scale-set per `(org, image)` you need.
-
-## Deploy a scale-set
+<!-- Add installation instructions here. This section is yours — the AI will not modify it. -->
 
 ```bash
-APP_ID=<github-app-id> \
-INSTALL_ID=<github-app-installation-id> \
-ORG=<github-org-or-user> \
-NAME=<scale-set-name>           # = the runs-on: label \
-IMAGE=ghcr.io/your-org/your-runner:tag \
-MAX=20 \
-PRIVATE_KEY_FILE=/path/to/app-private-key.pem \
-scripts/deploy-scale-set.sh
+git clone https://github.com/Interested-Deving-1896/build-server.git
+cd build-server
 ```
 
-The GitHub App webhook URL is **not used** — ARC pulls from GitHub's runner broker via long-polling with the App credentials.
+## Usage
 
-## Runner image contract
+<!-- Add usage examples here. This section is yours — the AI will not modify it. -->
 
-The reference image (`runner-image/`) and any custom image you want to use must satisfy ARC's DinD container mode:
+## Configuration
 
-1. **Base on `ghcr.io/actions/actions-runner:latest`** (or any image that ships the upstream runner layout). That gets you everything below for free.
-2. **`/home/runner/{run.sh,config.sh,bin,externals,k8s,env.sh,...}`** must be present. The chart's `init-dind-externals` init container `cp -r`s from `/home/runner/externals`; the runner container `exec`s `/home/runner/run.sh`. Missing either → `Init:Error` or `OCI runtime ... no such file or directory`.
-3. **`runner` user must be in a group with GID 123.** The chart hardcodes `DOCKER_GROUP_GID=123` for the dind sidecar, so the docker socket ends up owned `root:123` — the runner needs that group to use it. The upstream image already puts `runner` in `docker:123`. Without it: `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`.
+<!-- Document configuration options here. This section is yours — the AI will not modify it. -->
 
-`myoung34/github-runner` does **not** satisfy any of the above. It has no `run.sh`, no `externals/`, and its `docker` group is GID 500. Don't use it as a base — there's no clean ARC-DinD adapter that doesn't end up being a wrapper image with the missing pieces re-copied in.
+## CI
 
-## Operations
+<!-- AI:start:ci -->
+_CI documentation pending._
+<!-- AI:end:ci -->
 
-```bash
-# List scale-sets and pods
-kubectl get autoscalingrunnerset -A
-kubectl get pods -A | grep -E '^arc-'
+## Mirror chain
 
-# Tail listener logs
-kubectl -n arc-systems logs -l app.kubernetes.io/component=runner-scale-set-listener -f
+<!-- AI:start:mirror-chain -->
+This repo is maintained in [`Interested-Deving-1896/build-server`](https://github.com/Interested-Deving-1896/build-server) and mirrored through:
 
-# Bump max runners on an existing release
-helm upgrade <release> -n <namespace> --reuse-values --set maxRunners=50 \
-  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+```
+Interested-Deving-1896/build-server  ──►  OpenOS-Project-OSP/build-server  ──►  OpenOS-Project-Ecosystem-OOC/build-server
 ```
 
-## Tuning
+Changes flow downstream automatically via the hourly mirror chain in
+[`fork-sync-all`](https://github.com/Interested-Deving-1896/fork-sync-all).
+Direct commits to OSP or OOC are detected and opened as PRs back to `Interested-Deving-1896`.
+<!-- AI:end:mirror-chain -->
 
-- **Per-host capacity**: limit via `maxRunners` per scale-set + pod template resource requests.
-- **Burst latency**: first pull of a runner image is slow (~1-2 min for multi-GB images). Subsequent spawns hit local cache and start in ~30s.
+## Contributors
+
+<!-- AI:start:contributors -->
+_Contributors pending._
+<!-- AI:end:contributors -->
+
+## Origins
+
+<!-- AI:start:origins -->
+_Original project — no upstream fork._
+<!-- AI:end:origins -->
+
+## Resources
+
+<!-- AI:start:resources -->
+_No additional resource files found._
+<!-- AI:end:resources -->
+
+## License
+
+<!-- AI:start:license -->
+<!-- License not detected — add a LICENSE file to this repo. -->
+<!-- AI:end:license -->
