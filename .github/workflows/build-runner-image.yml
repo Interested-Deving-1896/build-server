@@ -10,7 +10,7 @@ on:
 
 concurrency:
   group: build-runner-image
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
