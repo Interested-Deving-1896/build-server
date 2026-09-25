@@ -91,6 +91,27 @@ heal_one() {
     return 0
   fi
 
+  # Outdated is not a wedge, and no restart cures it. GitHub retires old runner
+  # versions; the runner then exits 7, ARC marks the EphemeralRunner "Runner is
+  # deprecated", sets the AutoscalingRunnerSet phase to Outdated and deletes the
+  # listener and runner set on purpose. Only a spec change (a newer runner
+  # image) brings the pool back. On 2026-09-24 this looked exactly like "no live
+  # listener", and the watchdog restarted the controller every six minutes to
+  # no effect. Say what it is, once every 6 hours, and do not touch the controller.
+  local ars_phase outdated_file="$STATE/${key}.outdated"
+  ars_phase=$($KC get autoscalingrunnerset "$name" -n "$ns" -o jsonpath='{.status.phase}' 2>/dev/null)
+  if [ "$ars_phase" = "Outdated" ]; then
+    rm -f "$STATE/$key"
+    log "$ns/$name: phase=Outdated — runner image too old, not restarting the controller"
+    if [ -z "$(find "$outdated_file" -mmin -360 2>/dev/null)" ]; then
+      capture "$ns" "$name"
+      notify "🔴 ARC: <b>$ns/$name</b> is <b>Outdated</b> — GitHub retired the runner version in its image, and ARC removed the listener on purpose. Jobs will queue until the pool gets a newer runner image: rebuild <code>runner-image/</code> (workflow Build runner-image) and redeploy with its sha. Restarting the controller does not help."
+      touch "$outdated_file"
+    fi
+    return 0
+  fi
+  rm -f "$outdated_file"
+
   listener=$(printf '%s' "$listeners_json" | python3 -c "
 import json,sys
 d = json.load(sys.stdin)
