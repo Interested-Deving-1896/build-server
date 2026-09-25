@@ -13,10 +13,18 @@
 #
 #   2. The controller itself wedges (last observed hung on "deleting runner scale
 #      set", log frozen, single AutoscalingRunnerSet worker blocked) and no
-#      listener exists at all. Cure: rollout restart the controller.
+#      listener exists at all. Attempted cure: rollout restart the controller.
 #
 # Both leave zero red checks anywhere — jobs just queue silently — so the repair
 # is announced to Telegram when configured.
+#
+# The restart is not a reliable cure, and this script should not be read as one.
+# On 2026-09-24 both pools had no listener from 15:31 to 16:13 UTC; seven
+# restarts, one every six minutes, changed nothing. What brought them back was a
+# helm upgrade that altered the runner pod template and so forced the controller
+# to build a fresh EphemeralRunnerSet and listener. Until a capture below
+# explains the wedge, a repeat of this alert means the repair is not working —
+# it is a page, not a resolution.
 #
 # Config (optional), /etc/arc-watchdog/config:
 #   TG_CHAT=-1001234567890          # chat to announce repairs to
@@ -47,11 +55,43 @@ notify() {
     --data-urlencode text="$1" >/dev/null || log "telegram send failed"
 }
 
+# Everything the next reader will want and cannot get afterwards. `rollout
+# restart` deletes the controller pod, and with it the only log of whatever it
+# was doing; /var/log/pods is garbage-collected soon after. On 2026-09-24 the
+# pools sat without a listener for 42 minutes across seven of these restarts and
+# the reason is now unrecoverable for exactly that reason.
+capture() {
+  local ns="$1" name="$2"
+  local dir
+  dir="$STATE/incident-$(date -u +%Y%m%dT%H%M%SZ)-${ns}_${name}"
+  mkdir -p "$dir"
+  $KC -n arc-systems logs deploy/arc-gha-rs-controller --tail=4000 >"$dir/controller.log" 2>&1
+  $KC -n arc-systems logs -l app.kubernetes.io/component=runner-scale-set-listener \
+    --tail=500 --prefix >"$dir/listeners.log" 2>&1
+  $KC get autoscalingrunnerset,ephemeralrunnerset,autoscalinglistener -A -o yaml >"$dir/crs.yaml" 2>&1
+  $KC get pods -A -o wide >"$dir/pods.txt" 2>&1
+  $KC get events -A --sort-by=.lastTimestamp >"$dir/events.txt" 2>&1
+  log "captured evidence to $dir"
+  # Keep the last 20 incidents; this lives on the build disk.
+  ls -1dt "$STATE"/incident-* 2>/dev/null | tail -n +21 | xargs -r rm -rf
+}
+
 heal_one() {
   local ns="$1" name="$2"
   local key="${ns}_${name}" strikes listener ers_ref pod_ok=0 ref_ok=1
 
-  listener=$($KC get autoscalinglistener -n arc-systems -o json 2>/dev/null | python3 -c "
+  # An unreadable API is not an absent listener. When the node is starved the
+  # apiserver times out, and answering that by restarting the controller is the
+  # worst possible move: a fresh controller re-LISTs every pod, secret and
+  # EphemeralRunner from the datastore that is already the bottleneck. Read the
+  # exit status, not just the output.
+  local listeners_json
+  if ! listeners_json=$($KC get autoscalinglistener -n arc-systems -o json 2>&1); then
+    log "$ns/$name: cannot read AutoscalingListeners, API unavailable — no strike: ${listeners_json##*$'\n'}"
+    return 0
+  fi
+
+  listener=$(printf '%s' "$listeners_json" | python3 -c "
 import json,sys
 d = json.load(sys.stdin)
 for i in d.get('items', []):
@@ -84,6 +124,8 @@ for i in d.get('items', []):
   log "$ns/$name unhealthy (pod_ok=$pod_ok ref_ok=$ref_ok listener=${lpod:-none} ers_ref=${ers_ref:-none}) strike=$strikes"
   [ "$strikes" -ge "$STRIKES_TO_HEAL" ] || return 0
 
+  capture "$ns" "$name"
+
   if [ "$ref_ok" = 0 ] && [ -n "$lpod" ]; then
     log "healing: deleting stale AutoscalingListener $lpod (dangling ERS $ers_ref)"
     $KC delete autoscalinglistener "$lpod" -n arc-systems --timeout=60s
@@ -92,7 +134,7 @@ for i in d.get('items', []):
     log "healing: rollout restart of arc-gha-rs-controller"
     $KC -n arc-systems rollout restart deploy/arc-gha-rs-controller
     $KC -n arc-systems rollout status deploy/arc-gha-rs-controller --timeout=120s
-    notify "🛠 ARC self-heal: <b>$ns/$name</b> has no live listener; restarted arc-gha-rs-controller."
+    notify "🛠 ARC self-heal: <b>$ns/$name</b> has no live listener; restarted arc-gha-rs-controller. Evidence in <code>$STATE/</code> on the build host — the restart does not always cure this, and repeats mean it did not."
   fi
   rm -f "$STATE/$key"
 }

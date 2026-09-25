@@ -25,6 +25,35 @@ if ! command -v k3s >/dev/null 2>&1; then
 fi
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
+echo "=== Control-plane reservation ==="
+# k3s — apiserver, kine and kubelet in one process — shares this box with the
+# builds, and out of the box nothing is held back for it. Under CI load on
+# 2026-09-24 the builds won: kine answered in 18–83 s, the apiserver returned
+# `Handler timeout`, kubelet reported `PLEG is not healthy` and missed its node
+# lease, the node flapped NotReady, and the taint manager evicted the ARC
+# listeners. The pool went dead with jobs queuing and no red check anywhere.
+#
+# Sized from measurement on bld1, not from a rule of thumb: the k3s service
+# holds 1.94 GiB and pins about a core under reconcile churn; containerd,
+# tailscaled, sshd and journald together come to ~0.35 GiB. The eviction
+# threshold is what makes kubelet kill a runner pod before the kernel OOM killer
+# starts choosing for it — on 2026-09-24 its choice was the ARC controller.
+install -d /etc/rancher/k3s
+RESERVATION=$(cat <<'YAML'
+# Managed by build-server setup.sh — see the reservation block there.
+kubelet-arg:
+  - "kube-reserved=cpu=2000m,memory=3Gi"
+  - "system-reserved=cpu=500m,memory=1Gi"
+  - "eviction-hard=memory.available<1Gi,nodefs.available<10%"
+YAML
+)
+if [[ "$(cat /etc/rancher/k3s/config.yaml 2>/dev/null)" != "$RESERVATION" ]]; then
+  printf '%s\n' "$RESERVATION" > /etc/rancher/k3s/config.yaml
+  systemctl restart k3s
+  kubectl wait --for=condition=Ready node --all --timeout=180s
+fi
+kubectl get node -o jsonpath='{range .items[*]}{.metadata.name}{" allocatable cpu="}{.status.allocatable.cpu}{" mem="}{.status.allocatable.memory}{"\n"}{end}'
+
 echo "=== Firewall ==="
 # k3s binds the kube API on :6443 and the kubelet on :10250 to 0.0.0.0, and
 # sshd sits on :22 — on a public-IP box all three would face the internet.
@@ -63,8 +92,22 @@ if ! command -v helm >/dev/null 2>&1; then
 fi
 
 echo "=== actions-runner-controller (ARC) ==="
+# The chart ships `resources: {}`, which lands the controller in BestEffort —
+# the QoS class the kernel OOM killer empties first. On 2026-09-24 that is
+# exactly what happened (exit 137), and with the controller gone no listener is
+# recreated, so the pools stay dead. Measured usage is 16m CPU / 43Mi.
+# The NoExecute tolerations are unbounded on purpose: this is a single-node
+# cluster, so evicting the controller can only mean "nowhere", never "elsewhere".
+# Pinned, and the same version scripts/deploy-scale-set.sh pins: the listener
+# image comes from the controller chart and the runner spec from the scale-set
+# chart, and ARC does not support the two drifting apart. Unpinned, rebuilding
+# the box would silently install whatever ARC has released since.
+ARC_VERSION="${ARC_VERSION:-0.14.2}"
 helm upgrade --install arc \
   --namespace arc-systems --create-namespace \
+  --set-json 'resources={"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"memory":"512Mi"}}' \
+  --set-json 'tolerations=[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}]' \
+  --version "$ARC_VERSION" \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
 
 echo "=== Wait for controller ==="

@@ -1,0 +1,8 @@
+# Shell scripts run on Linux hosts; a CRLF heredoc terminator is unmatchable
+# and the script dies at parse time. Keep them LF whatever the checkout OS.
+*.sh text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+# The lint workflow embeds a python heredoc; a CRLF terminator would break it.
+*.yml text eol=lf
+*.yaml text eol=lf

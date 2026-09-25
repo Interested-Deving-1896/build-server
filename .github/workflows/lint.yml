@@ -1,0 +1,136 @@
+name: lint
+
+# Everything here is about one failure mode: a script in this repo that looks
+# fine in review and cannot run on the host. deploy-scale-set.sh was in that
+# state from 950b697 (2026-08-08) until ae09790 — CRLF plus an apostrophe in a
+# ${VAR:?word} message, both fatal at parse time, both invisible in a diff.
+# Nobody noticed because nothing here was ever executed by CI.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    # GitHub-hosted on purpose: this repo IS the self-hosted pool. Its own CI
+    # must still run when the pool is down — which is exactly when it is needed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No CRLF in scripts and unit files
+        run: |
+          bad=()
+          while IFS= read -r f; do
+            grep -q $'\r' "$f" && bad+=("$f")
+          done < <(git ls-files -- '*.sh' 'systemd/*' 'lib/*' 'awg/*')
+          if ((${#bad[@]})); then
+            printf 'CRLF line endings — unrunnable on Linux:\n'
+            printf '  %s\n' "${bad[@]}"
+            exit 1
+          fi
+
+      - name: Every script parses
+        run: |
+          rc=0
+          while IFS= read -r f; do
+            bash -n "$f" || rc=1
+          done < <(git ls-files -- '*.sh')
+          exit $rc
+
+      - name: shellcheck
+        run: shellcheck --severity=warning $(git ls-files -- '*.sh')
+
+      - name: Scripts are executable
+        # The README tells you to run these directly; a 100644 mode turns that
+        # into "Permission denied" on a fresh clone.
+        run: |
+          bad=$(git ls-files -s -- 'scripts/*.sh' | awk '$1 != "100755" {print $4}')
+          if [ -n "$bad" ]; then
+            printf 'not executable in git:\n%s\n' "$bad"
+            exit 1
+          fi
+
+  overlay:
+    # deploy-scale-set.sh writes a YAML overlay by string interpolation into a
+    # heredoc. Render it and assert the properties that took bld1 down on
+    # 2026-09-24 when they were absent.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render the scale-set overlay
+        run: |
+          mkdir -p stub
+          printf '#!/bin/sh\nexit 0\n' > stub/kubectl
+          printf '#!/bin/sh\nfor a in "$@"; do case "$a" in /tmp/arc-overlay-*) cat "$a";; esac; done\n' > stub/helm
+          chmod +x stub/kubectl stub/helm
+          echo dummy-key > stub/app.pem
+          PATH="$PWD/stub:$PATH" \
+          APP_ID=1 INSTALL_ID=2 ORG=example NAME=example-linux MAX=20 \
+          REGISTRY_MIRRORS=http://10.43.104.17:5000 \
+          PRIVATE_KEY_FILE="$PWD/stub/app.pem" \
+            scripts/deploy-scale-set.sh > overlay.yaml
+          cat overlay.yaml
+
+      - name: The overlay keeps the job tree off RAM and caps every container
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+
+          overlay = yaml.safe_load(open("overlay.yaml"))
+          spec = overlay["template"]["spec"]
+          fail = []
+
+          # A memory-backed emptyDir is RAM no request accounts for, and
+          # sizeLimit is per volume: maxRunners x 16Gi of `work` promised
+          # 320 GiB on a 62 GiB box and put the node into swap thrash.
+          # dind-sock is 32 KB of socket directory and may stay in memory.
+          for vol in spec["volumes"]:
+              if vol["name"] == "dind-sock":
+                  continue
+              if vol.get("emptyDir", {}).get("medium") == "Memory":
+                  fail.append(f"volume {vol['name']}: emptyDir medium=Memory")
+
+          # Uncapped, an overrunning job takes the node — and with it the k3s
+          # control plane — instead of taking only itself. Both containers need
+          # both caps: the runner was capped at 4 CPU on 2026-09-24 while the
+          # uncapped dind beside it took 14.8 of the node's 24 cores.
+          for c in spec["containers"]:
+              res = c.get("resources", {})
+              for kind in ("requests", "limits"):
+                  for what in ("cpu", "memory"):
+                      if not res.get(kind, {}).get(what):
+                          fail.append(f"container {c['name']}: no {what} {kind[:-1]}")
+
+          # The listener is the only thing that can take a job from GitHub and
+          # there is nowhere else to run it: a node blip must not evict it, and
+          # BestEffort QoS must not offer it to the OOM killer first.
+          listener = overlay["listenerTemplate"]["spec"]
+          tolerated = {t["key"] for t in listener.get("tolerations", [])
+                       if t.get("effect") == "NoExecute"
+                       and t.get("tolerationSeconds") is None}
+          for key in ("node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable"):
+              if key not in tolerated:
+                  fail.append(f"listener: no unbounded NoExecute toleration for {key}")
+          lc = next(c for c in listener["containers"] if c["name"] == "listener")
+          if not lc.get("resources", {}).get("requests", {}).get("memory"):
+              fail.append("listener: no memory request (BestEffort)")
+
+          # REGISTRY_MIRRORS must reach dockerd ahead of the built-in mirror,
+          # or a deploy silently drops the in-cluster pull-through cache.
+          dind = next(c for c in spec["containers"] if c["name"] == "dind")
+          mirrors = [a.split("=", 1)[1] for a in dind["args"]
+                     if a.startswith("--registry-mirror=")]
+          if mirrors != ["http://10.43.104.17:5000", "https://mirror.gcr.io"]:
+              fail.append(f"registry mirrors wrong or misordered: {mirrors}")
+
+          if fail:
+              print("\n".join(fail))
+              sys.exit(1)
+          print("overlay ok")
+          PY

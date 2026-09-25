@@ -17,6 +17,7 @@
 set -euo pipefail
 
 MSS="${MSS:-1410}"
+# shellcheck disable=SC2054 # SYN,RST is one iptables argument — its comma is syntax
 RULE=(-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS")
 
 # Idempotent: drop any prior copies, then add exactly one.
