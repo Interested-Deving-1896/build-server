@@ -56,13 +56,23 @@ APP_ID=3743839 INSTALL_ID=133105803 ORG=izi-x NAME=izi-x-linux MAX=20 \
 # NAMESPACE is mandatory here: the pool lives in arc-miraj, while the default
 # derived from the org would be arc-miraj-os. Deploy without it and you get a
 # second scale-set sharing the same GitHub registration instead of an upgrade.
-APP_ID=3743839 INSTALL_ID=133143010 ORG=Miraj-OS NAME=self-hosted MAX=8 \
+APP_ID=3743839 INSTALL_ID=133143010 ORG=Miraj-OS NAME=self-hosted MIN=0 MAX=8 \
   NAMESPACE=arc-miraj RELEASE=miraj-self-hosted \
-  MEM_REQUEST=2Gi DIND_MEM_REQUEST=1Gi \
+  CPU_REQUEST=500m MEM_REQUEST=2Gi DIND_CPU_REQUEST=250m DIND_MEM_REQUEST=1Gi \
   REGISTRY_MIRRORS=http://10.43.104.17:5000 \
   IMAGE=ghcr.io/jakwuh/actions-runner:<sha> \
   PRIVATE_KEY_FILE=<app>.pem scripts/deploy-scale-set.sh
 ```
+
+Miraj sizing was approved on 2026-10-03: keep the pool and shared BuildKit,
+scale idle runners to zero, and reserve 500m CPU for runner + 250m for DinD.
+Memory requests stay 2Gi + 1Gi, CPU limits 4 + 4, memory limits 6Gi + 4Gi,
+and maxRunners stays 8. A cold job may wait for a new runner; compare queue and
+execution time before treating the smaller reservation as an improvement.
+Rollback sizing: `MIN=1 CPU_REQUEST=1 DIND_CPU_REQUEST=1`, retaining every
+other value. For an existing release, save `helm get values` and upgrade the
+same pinned chart with a full values file that changes only these three fields;
+do not redeploy GitHub credentials just to change sizing.
 
 Pin `IMAGE` to a commit sha, never `:latest` — a scale-set is only rolled when its pod
 template changes, so a moving tag means the pool keeps running whatever it pulled first.
