@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily prune of the shared CI dependency caches
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

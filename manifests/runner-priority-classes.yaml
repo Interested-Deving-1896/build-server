@@ -1,23 +1,16 @@
-# Runner pod priorities on the shared build host. Pods of a priority pool are
-# scheduled ahead of the default pool when the node runs out of requests;
-# preemptionPolicy: Never — a higher class waits for free room, it never evicts
-# a running job. Pools without PRIORITY_CLASS stay at the cluster default (0).
+# Runner pod priorities on the shared build host: release ahead of main ahead of
+# everything else (PR pools carry no class, like the Miraj pool). A class only
+# orders pending pods when the node runs out of requests. preemptionPolicy: Never
+# on purpose — classes are cluster-wide, and buildkitd, registry-cache, the ARC
+# listeners and the Miraj runners all sit at priority 0, so a preempting release
+# pod would be allowed to evict the very buildkitd it builds against.
 #
 #   kubectl apply -f manifests/runner-priority-classes.yaml
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
 metadata:
-  name: ci-light
-value: 2000
-preemptionPolicy: Never
-globalDefault: false
-description: Light CI jobs (gates, notifications, stand deploy) - small pods that unblock everything else
----
-apiVersion: scheduling.k8s.io/v1
-kind: PriorityClass
-metadata:
   name: ci-release
-value: 1000
+value: 3000
 preemptionPolicy: Never
 globalDefault: false
 description: CI jobs on release branches
@@ -26,7 +19,7 @@ apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
 metadata:
   name: ci-main
-value: 500
+value: 2000
 preemptionPolicy: Never
 globalDefault: false
 description: CI jobs on the main branch

@@ -1,0 +1,92 @@
+# Persistent BuildKit daemon for izi-x main/release image builds (build-api-crm.yml and
+# the other build-*.yml, driver: remote).
+#
+# Why: main/release built in a fresh docker-container builder inside each job's dind:
+# setup-buildx 260–935 s, QEMU setup 150–270 s, then every layer and the npm cache from
+# scratch, exported to the registry in mode=max (37–58 min per release, 2026-10).
+#
+# Separate from buildkitd-arc-izi-x.yaml on purpose: that one runs PR code, and a cache
+# mount shared with it could poison a prod image. The ConfigMap is shared.
+#
+# arm64 (prod-sa) runs through the host binfmt registration (qemu-user-static, setup.sh).
+# Endpoint: tcp://buildkitd-trusted.arc-izi-x.svc.cluster.local:1234
+# Cache: hostPath /opt/buildkit-cache-izi-x-trusted, GC keeps it under ~40GB.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkitd-trusted
+  namespace: arc-izi-x
+  labels: { app: buildkitd-trusted }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # single cache dir — never two writers
+  selector:
+    matchLabels: { app: buildkitd-trusted }
+  template:
+    metadata:
+      labels: { app: buildkitd-trusted }
+    spec:
+      containers:
+        - name: buildkitd
+          image: mirror.gcr.io/moby/buildkit:v0.30.0
+          args:
+            - --addr
+            - tcp://0.0.0.0:1234
+            - --config
+            - /etc/buildkit/buildkitd.toml
+          securityContext:
+            privileged: true
+          ports:
+            - containerPort: 1234
+          # Builds run here instead of in each job's dind sidecar. The limit keeps
+          # concurrent builds from taking the node (README: 2026-09-24).
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits: { cpu: "8", memory: 12Gi }
+          readinessProbe:
+            tcpSocket: { port: 1234 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: 1234 }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            - { name: cache, mountPath: /var/lib/buildkit }
+            - { name: config, mountPath: /etc/buildkit }
+      volumes:
+        - name: cache
+          hostPath: { path: /opt/buildkit-cache-izi-x-trusted, type: DirectoryOrCreate }
+        - name: config
+          configMap: { name: buildkitd-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkitd-trusted
+  namespace: arc-izi-x
+spec:
+  selector: { app: buildkitd-trusted }
+  ports:
+    - port: 1234
+      targetPort: 1234
+---
+# Only main/release runner pods may talk to it: PR code never reaches this cache.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: buildkitd-trusted-main-release-only
+  namespace: arc-izi-x
+spec:
+  podSelector:
+    matchLabels: { app: buildkitd-trusted }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: actions.github.com/scale-set-name
+                operator: In
+                values: [izi-x-main-small, izi-x-release-small]
+      ports:
+        - port: 1234

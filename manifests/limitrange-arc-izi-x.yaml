@@ -1,0 +1,15 @@
+# Defaults for containers that declare no resources of their own in arc-izi-x: the
+# service containers of `services:` jobs on the CONTAINER_MODE=kubernetes-novolume
+# pools. The ARC hooks create them from the workflow, so nothing else can put a limit
+# on them, and an unlimited postgres next to the builds can take the node (README:
+# 2026-09-24). Everything the repo deploys here sets its own resources.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: container-defaults
+  namespace: arc-izi-x
+spec:
+  limits:
+    - type: Container
+      defaultRequest: { cpu: 250m, memory: 256Mi }
+      default: { cpu: "2", memory: 2Gi }

@@ -39,19 +39,13 @@ scripts/deploy-scale-set.sh
 
 The GitHub App webhook URL is **not used** — ARC pulls from GitHub's runner broker via long-polling with the App credentials.
 
-### The two scale-sets on `bld1`
+### The scale-sets on `bld1`
 
 Written down because the sizing is not the defaults, and re-running the script without
 these would quietly shrink the pools and drop miraj's local registry mirror. `PRIVATE_KEY_FILE`
 is the **jakwuh-build-server** App PEM; App id `3743839` for both.
 
 ```bash
-# izi-x org — the product CI pool
-APP_ID=3743839 INSTALL_ID=133105803 ORG=izi-x NAME=izi-x-linux MAX=20 \
-  CPU_REQUEST=500m MEM_REQUEST=1Gi DIND_CPU_REQUEST=250m DIND_MEM_REQUEST=512Mi \
-  IMAGE=ghcr.io/jakwuh/actions-runner:<sha> \
-  PRIVATE_KEY_FILE=<app>.pem scripts/deploy-scale-set.sh
-
 # Miraj-OS org — `runs-on: self-hosted`; also pulls through the in-cluster registry cache.
 # NAMESPACE is mandatory here: the pool lives in arc-miraj, while the default
 # derived from the org would be arc-miraj-os. Deploy without it and you get a
@@ -74,36 +68,74 @@ other value. For an existing release, save `helm get values` and upgrade the
 same pinned chart with a full values file that changes only these three fields;
 do not redeploy GitHub credentials just to change sizing.
 
+#### izi-x: one pool per (priority tier × size)
+
+ARC cannot size or prioritise a pod per job: a scale set is one pod template, and the
+pod exists before GitHub tells it which job it runs. So the two axes are two choices
+made by the workflow's `runs-on`:
+
+- **tier** — `release` (push/dispatch/schedule on `release`, `mobile-widget/release`,
+  `mobile-widget/pre-release`), `main` (the same events on `main`), `pr` (everything else —
+  `pull_request_target` and `issue_comment` report `ref_name=main`, hence the event check).
+  Release and main have their own `maxRunners`, so they never queue behind PR jobs for a
+  runner, and a PriorityClass that puts their pods first when the node is full;
+- **size** — `small` (no dind: gates, deploy, schema audit, secret scan, and every image
+  build — they are only clients of a persistent buildkitd), `heavy` (no dind: validate
+  api/crm, mobile checks), `k8s` (`CONTAINER_MODE=kubernetes-novolume`: jobs with
+  `container:`/`services:` — migrations compat, e2e — run as their own pod on images the
+  node's containerd keeps; in dind they were pulled and unpacked into an empty store on
+  every job, 173–1648 s to start).
+
+Image builds run on two persistent buildkitd: `buildkitd` (PR code,
+`vars.PR_BUILDKIT_ENDPOINT`) and `buildkitd-trusted` (main/release only, NetworkPolicy,
+`vars.TRUSTED_BUILDKIT_ENDPOINT`) — a cache mount shared with PR code could poison a prod
+image. arm64 runs through the host's binfmt (`qemu-user-static`, setup.sh).
+
+Sizes are measured per container on bld1 on 2026-10-07 (`host="bld1"` in the dev
+VictoriaMetrics): small jobs ≤613 MiB / ≤1.73 cores; validate-crm 6.0 GiB at its 6Gi limit
+and 4.1 cores, mobile checks 3.6 GiB / 3.3 cores; migrations compat ≤1346 MiB.
+
+| scale set | tier | PriorityClass | runner req → lim | job pod req → lim | MAX |
+| --- | --- | --- | --- | --- | --- |
+| `izi-x-pr-small` | pr | — | 250m/512Mi → 2/1Gi | — | 20 |
+| `izi-x-pr-heavy` | pr | — | 2/4Gi → 4/6Gi | — | 6 |
+| `izi-x-pr-k8s` | pr | — | 100m/256Mi → 1/1Gi | 1/2Gi → 4/6Gi | 6 |
+| `izi-x-main-small` | main | `ci-main` | 250m/512Mi → 2/1Gi | — | 3 |
+| `izi-x-main-heavy` | main | `ci-main` | 2/4Gi → 4/6Gi | — | 4 |
+| `izi-x-main-k8s` | main | `ci-main` | 100m/256Mi → 1/1Gi | 1/2Gi → 4/6Gi | 2 |
+| `izi-x-release-small` | release | `ci-release` | 250m/512Mi → 2/1Gi | — | 4 |
+| `izi-x-release-large` | release | `ci-release` | 2/4Gi → 4/6Gi | — | 5 |
+
+All izi-x pools run with `DIND_EXTERNALS=false` and `CI_HOST_CACHE=true`
+(`scripts/install-ci-host-cache.sh` must have run on the node first). Service containers of
+`k8s` jobs get the `manifests/limitrange-arc-izi-x.yaml` defaults.
+
 ```bash
-# izi-x routes jobs between these pools with repo variables; set a variable only
-# after its pool is up — a job for a label nobody serves queues for 24h.
-#   RUNNER_LIGHT  → izi-x-linux-light   (gates, notifications, stand deploy; no docker)
-#   RUNNER_NODIND → izi-x-linux-nodind  (validate/lint/test, flutter checks; no docker)
-#   RUNNER_MAIN / RUNNER_RELEASE → izi-x-linux-main / izi-x-linux-release (priority)
-# izi-x-linux requests are sized from 48h of per-container usage (2026-10-03..05):
-# dind p99 0.21Gi (PR builds go to the shared buildkitd), runner p90 1.07Gi; the
-# hungriest jobs (validate-*, flutter checks, up to 5.5Gi) run on izi-x-linux-nodind.
-# Node usage peaked at 22.8 of 62GiB while 3Gi requests had it "full" at ~17 pods.
-# Changing the pod template drains the pool (no new jobs until running ones finish):
-# do it off-peak.
-# First: kubectl apply -f manifests/runner-priority-classes.yaml
-COMMON="APP_ID=3743839 INSTALL_ID=133105803 ORG=izi-x NAMESPACE=arc-izi-x IMAGE=ghcr.io/jakwuh/actions-runner:<sha> PRIVATE_KEY_FILE=<app>.pem"
-env $COMMON NAME=izi-x-linux-light DIND=false PRIORITY_CLASS=ci-light MIN=1 MAX=8 \
-  CPU_REQUEST=100m MEM_REQUEST=384Mi CPU_LIMIT=1 MEM_LIMIT=1Gi scripts/deploy-scale-set.sh
-env $COMMON NAME=izi-x-linux-nodind DIND=false MIN=1 MAX=12 \
-  CPU_REQUEST=500m MEM_REQUEST=2Gi CPU_LIMIT=4 MEM_LIMIT=6Gi WORK_SIZE=16Gi scripts/deploy-scale-set.sh
-env $COMMON NAME=izi-x-linux-release PRIORITY_CLASS=ci-release MIN=0 MAX=8 \
-  CPU_REQUEST=500m MEM_REQUEST=2Gi DIND_CPU_REQUEST=250m DIND_MEM_REQUEST=1Gi scripts/deploy-scale-set.sh
-env $COMMON NAME=izi-x-linux-main PRIORITY_CLASS=ci-main MIN=0 MAX=6 \
-  CPU_REQUEST=500m MEM_REQUEST=2Gi DIND_CPU_REQUEST=250m DIND_MEM_REQUEST=1Gi scripts/deploy-scale-set.sh
+# First: kubectl apply -f manifests/runner-priority-classes.yaml manifests/limitrange-arc-izi-x.yaml
+COMMON="APP_ID=3743839 INSTALL_ID=133105803 ORG=izi-x NAMESPACE=arc-izi-x IMAGE=ghcr.io/jakwuh/actions-runner:<sha> PRIVATE_KEY_FILE=<app>.pem DIND_EXTERNALS=false CI_HOST_CACHE=true"
+SMALL="DIND=false CPU_REQUEST=250m MEM_REQUEST=512Mi CPU_LIMIT=2 MEM_LIMIT=1Gi WORK_SIZE=4Gi"
+HEAVY="DIND=false CPU_REQUEST=2 MEM_REQUEST=4Gi CPU_LIMIT=4 MEM_LIMIT=6Gi WORK_SIZE=16Gi"
+K8S="DIND=false CONTAINER_MODE=kubernetes-novolume CPU_REQUEST=1 MEM_REQUEST=2Gi CPU_LIMIT=4 MEM_LIMIT=6Gi WORK_SIZE=8Gi"
+env $COMMON $SMALL NAME=izi-x-pr-small      MIN=1 MAX=20 scripts/deploy-scale-set.sh
+env $COMMON $HEAVY NAME=izi-x-pr-heavy      MIN=0 MAX=6  scripts/deploy-scale-set.sh
+env $COMMON $K8S   NAME=izi-x-pr-k8s        MIN=0 MAX=6  scripts/deploy-scale-set.sh
+env $COMMON $SMALL NAME=izi-x-main-small    MIN=0 MAX=3  PRIORITY_CLASS=ci-main scripts/deploy-scale-set.sh
+env $COMMON $HEAVY NAME=izi-x-main-heavy    MIN=0 MAX=4  PRIORITY_CLASS=ci-main scripts/deploy-scale-set.sh
+env $COMMON $K8S   NAME=izi-x-main-k8s      MIN=0 MAX=2  PRIORITY_CLASS=ci-main scripts/deploy-scale-set.sh
+env $COMMON $SMALL NAME=izi-x-release-small MIN=0 MAX=4  PRIORITY_CLASS=ci-release scripts/deploy-scale-set.sh
+env $COMMON $HEAVY NAME=izi-x-release-large MIN=0 MAX=5  PRIORITY_CLASS=ci-release scripts/deploy-scale-set.sh
 ```
 
-Rolling a pool back — order matters, or required PR gates and release jobs queue
-forever for a label nobody serves: delete the izi-x repo variable, wait until no
-queued job asks for that label, `helm uninstall <release> -n arc-izi-x` (keep
-`github-app` and `ghcr-pull` — shared), and only then delete PriorityClasses nobody uses.
-Priority pools also change the neighbours: Miraj-OS pods (priority 0) queue behind
-izi-x release/main pods on a full node and are evicted earlier under memory pressure.
+To change only sizing on a live pool, `helm get values` it and `helm upgrade` the same pinned
+chart with the full file — not `--reuse-values --set maxRunners=…`: the chart compares
+`minRunners` (float64 from the stored values) with the int64 from `--set` and fails.
+Changing a pool's pod template recreates its listener; on 2026-10-07 the old listener stayed
+in `Terminating` both times and the pool took no jobs until it was force-deleted
+(`kubectl -n arc-systems delete pod <release>-<hash>-listener --force --grace-period=0`).
+
+Retiring a pool — order matters, or jobs queue for 24h for a label nobody serves: change the
+workflows' `runs-on` first, wait until no queued job asks for the label, then
+`helm uninstall <release> -n arc-izi-x` (keep `github-app` and `ghcr-pull` — shared).
 
 Pin `IMAGE` to a commit sha, never `:latest` — a scale-set is only rolled when its pod
 template changes, so a moving tag means the pool keeps running whatever it pulled first.
