@@ -1,0 +1,106 @@
+# Persistent shared BuildKit daemon for izi-x PR stand builds (pr-stand.yml, driver: remote).
+#
+# Why: every build-api/build-crm job booted a fresh docker-container builder inside its
+# dind sidecar — 24s pulling moby/buildkit + ~63s booting — then spent ~67s resolving
+# node:24-slim metadata through mirror.gcr.io and ran `npm ci` from scratch, because an
+# ephemeral builder has no local cache (measured on a 2026-10-02 build: ~3.5 of its 9.5
+# minutes). A long-lived buildkitd keeps layers and the npm cache mount on the node.
+#
+# Only PR stand builds use it. main/release keep their own ephemeral builders: a PR build
+# runs PR code inside BuildKit, and a shared cache must not be able to reach a prod image.
+#
+# Endpoint: tcp://buildkitd.arc-izi-x.svc.cluster.local:1234 — reachable from arc-izi-x
+# only (NetworkPolicy below): the daemon is unauthenticated and its cache holds izi-x code.
+# Cache: hostPath /opt/buildkit-cache-izi-x, GC keeps it under ~40GB.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: buildkitd-config
+  namespace: arc-izi-x
+data:
+  buildkitd.toml: |
+    # docker.io through the in-cluster pull-through cache (registry-cache → mirror.gcr.io).
+    [registry."docker.io"]
+      mirrors = ["registry.registry-cache.svc.cluster.local:5000"]
+    [registry."registry.registry-cache.svc.cluster.local:5000"]
+      http = true
+    [worker.oci]
+      enabled = true
+      gc = true
+      gckeepstorage = 40000000000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkitd
+  namespace: arc-izi-x
+  labels: { app: buildkitd }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # single cache dir — never two writers
+  selector:
+    matchLabels: { app: buildkitd }
+  template:
+    metadata:
+      labels: { app: buildkitd }
+    spec:
+      containers:
+        - name: buildkitd
+          image: mirror.gcr.io/moby/buildkit:v0.30.0
+          args:
+            - --addr
+            - tcp://0.0.0.0:1234
+            - --config
+            - /etc/buildkit/buildkitd.toml
+          securityContext:
+            privileged: true
+          ports:
+            - containerPort: 1234
+          # Builds run here instead of in each job's dind sidecar. The limit keeps
+          # concurrent builds from taking the node (README: 2026-09-24).
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits: { cpu: "8", memory: 12Gi }
+          readinessProbe:
+            tcpSocket: { port: 1234 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: 1234 }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            - { name: cache, mountPath: /var/lib/buildkit }
+            - { name: config, mountPath: /etc/buildkit }
+      volumes:
+        - name: cache
+          hostPath: { path: /opt/buildkit-cache-izi-x, type: DirectoryOrCreate }
+        - name: config
+          configMap: { name: buildkitd-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkitd
+  namespace: arc-izi-x
+spec:
+  selector: { app: buildkitd }
+  ports:
+    - port: 1234
+      targetPort: 1234
+---
+# Only izi-x runner pods may talk to the daemon.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: buildkitd-izi-x-only
+  namespace: arc-izi-x
+spec:
+  podSelector:
+    matchLabels: { app: buildkitd }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 1234

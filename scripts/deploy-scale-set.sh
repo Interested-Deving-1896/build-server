@@ -87,16 +87,34 @@ NS="${NAMESPACE:-arc-$(echo "$ORG" | tr '[:upper:]' '[:lower:]')}"
 # helm refuses outright ("cannot be imported into the current release"), which
 # is the pleasant failure; the namespace one above fails silently.
 RELEASE="${RELEASE:-$NAME}"
+# PriorityClass for the runner pods (manifests/runner-priority-classes.yaml).
+# When the node is full, the scheduler places a higher-priority pending pod
+# first. The classes use preemptionPolicy: Never, so a running job is never evicted.
+PRIORITY_CLASS="${PRIORITY_CLASS:-}"
+# DIND=false — runner without the dind sidecar, for jobs that never call docker
+# (API calls, git, curl, node/flutter checks). A dind pod reserves runner + dind
+# requests and pays the externals init copy on start; on 2026-10-01 and 10-05 such
+# jobs sat Pending on "Insufficient memory" next to real builds.
+DIND="${DIND:-true}"
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+case "$DIND" in true|false) ;; *) echo "DIND must be true or false, got: $DIND" >&2; exit 1 ;; esac
+# A runner pod naming a missing PriorityClass is rejected (Forbidden); ARC 0.14 marks
+# the runner Failed and counts it toward maxRunners for good — the pool dies with
+# nothing red anywhere. Refuse to deploy instead.
+[ -z "$PRIORITY_CLASS" ] || kubectl get priorityclass "$PRIORITY_CLASS" >/dev/null
 
 PRIV_KEY=$(cat "$PRIVATE_KEY_FILE")
 
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n "$NS" delete secret github-app --ignore-not-found
+# apply, not delete+create: every pool in the namespace reads this one secret, and
+# a create that fails after the delete (apiserver timeouts under load, 2026-09-24)
+# would leave all of them unable to create runners, with nothing red anywhere.
 kubectl -n "$NS" create secret generic github-app \
   --from-literal=github_app_id="$APP_ID" \
   --from-literal=github_app_installation_id="$INSTALL_ID" \
-  --from-literal=github_app_private_key="$PRIV_KEY"
+  --from-literal=github_app_private_key="$PRIV_KEY" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
 # Build a full-spec overlay so helm never has to construct partial array
 # elements (--set containers[0].x replaces the entire element, losing
@@ -132,8 +150,37 @@ listenerTemplate:
       resources:
         requests: { cpu: 50m, memory: 64Mi }
         limits: { memory: 256Mi }
+YAML
+
+if [ "$DIND" = "false" ]; then
+cat >> "$OVERLAY" << YAML
 template:
-  spec:
+  spec:${PRIORITY_CLASS:+
+    priorityClassName: $PRIORITY_CLASS}
+    imagePullSecrets:
+    - name: ghcr-pull
+    containers:
+    - name: runner
+      image: $IMAGE
+      imagePullPolicy: IfNotPresent
+      command: [/home/runner/run.sh]
+      resources:
+        requests:
+          cpu: "$CPU_REQUEST"
+          memory: $MEM_REQUEST
+        limits:
+          cpu: "$CPU_LIMIT"
+          memory: $MEM_LIMIT
+      volumeMounts:
+      - { mountPath: /home/runner/_work, name: work }
+    volumes:
+    - { name: work, emptyDir: { sizeLimit: ${WORK_SIZE:-4Gi} } }
+YAML
+else
+cat >> "$OVERLAY" << YAML
+template:
+  spec:${PRIORITY_CLASS:+
+    priorityClassName: $PRIORITY_CLASS}
     imagePullSecrets:
     - name: ghcr-pull
     initContainers:
@@ -195,6 +242,7 @@ template:
     - { name: dind-sock,      emptyDir: { medium: Memory, sizeLimit: 256Mi } }
     - { name: dind-externals, emptyDir: { sizeLimit: 1Gi   } }
 YAML
+fi
 
 helm upgrade --install "$RELEASE" \
   --namespace "$NS" \

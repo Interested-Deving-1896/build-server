@@ -139,6 +139,9 @@ echo "=== In-cluster helpers ==="
 # applied by hand, which is why a rebuilt box came up subtly slower.
 kubectl apply -f "$RAW/manifests/registry-cache.yaml"
 kubectl apply -f "$RAW/manifests/buildkitd-arc-miraj.yaml"
+kubectl apply -f "$RAW/manifests/buildkitd-arc-izi-x.yaml"
+# Runner pod priorities — a pool deployed with PRIORITY_CLASS dies silently without them.
+kubectl apply -f "$RAW/manifests/runner-priority-classes.yaml"
 
 echo
 echo "ARC installed. Deploy scale-sets with: scripts/deploy-scale-set.sh"
