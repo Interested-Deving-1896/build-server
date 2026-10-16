@@ -58,6 +58,7 @@ Direct commits to OSP or OOC are detected and opened as PRs back to `Interested-
 | [@jakwuh](https://github.com/jakwuh) | 58 |
 | [@Lunatik-006](https://github.com/Lunatik-006) | 4 |
 | [@SharrkSummoner](https://github.com/SharrkSummoner) | 1 |
+| [@Interested-Deving-1896](https://github.com/Interested-Deving-1896) | 1 |
 <!-- AI:end:contributors -->
 
 ## Origins
